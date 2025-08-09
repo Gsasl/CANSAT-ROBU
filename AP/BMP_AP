@@ -1,0 +1,259 @@
+// Here the code combines AP creation, BMP read and SD log
+#include <WiFi.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_BMP280.h>
+
+// ===== AP credentials (password must be >= 8 chars) =====
+const char* AP_SSID     = "ESP32-Logger";
+const char* AP_PASSWORD = "esp32logger";
+
+// ===== Pins =====
+static const int I2C_SDA = 21;
+static const int I2C_SCL = 22;
+
+static const int SD_CS   = 5;   // Change if needed (avoid GPIO12)
+static const int SD_SCK  = 18;
+static const int SD_MISO = 19;
+static const int SD_MOSI = 23;
+
+// ===== Sensor/Logging =====
+Adafruit_BMP280 bmp; // I2C
+const float SEA_LEVEL_HPA = 1013.25; // Adjust for better altitude accuracy
+
+// Logging interval (ms)
+const uint32_t LOG_INTERVAL_MS = 5000;
+uint32_t lastLog = 0;
+
+// SD/CSV
+SPIClass spiSD(VSPI);
+const char* LOG_PATH = "/log.csv";
+
+// Network
+WiFiServer server(80);
+
+// State
+bool sensorInitialized = false;
+bool sdInitialized = false;
+
+// ---- Helpers ----
+bool initBMP280() {
+  // Try both addresses
+  if (bmp.begin(0x76) || bmp.begin(0x77)) {
+    // Sampling configuration
+    bmp.setSampling(
+      Adafruit_BMP280::MODE_NORMAL,
+      Adafruit_BMP280::SAMPLING_X2,    // temperature oversampling
+      Adafruit_BMP280::SAMPLING_X16,   // pressure oversampling
+      Adafruit_BMP280::FILTER_X16,     // IIR filter
+      Adafruit_BMP280::STANDBY_MS_500  // standby time
+    );
+    Serial.println("BMP280 initialized");
+    return true;
+  }
+  Serial.println("BMP280 not found (0x76/0x77). Check wiring/ADDR.");
+  return false;
+}
+
+bool initSD() {
+  spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, spiSD)) {
+    Serial.println("SD init failed");
+    return false;
+  }
+  Serial.println("SD initialized");
+
+  // Create file and header if new/empty
+  if (!SD.exists(LOG_PATH)) {
+    File f = SD.open(LOG_PATH, FILE_WRITE);
+    if (f) {
+      f.println("millis,temp_c,pressure_hpa,alt_m");
+      f.close();
+      Serial.println("Created new log with header");
+    } else {
+      Serial.println("Failed to create log file");
+      return false;
+    }
+  } else {
+    File f = SD.open(LOG_PATH, FILE_READ);
+    if (f && f.size() == 0) {
+      f.close();
+      f = SD.open(LOG_PATH, FILE_WRITE);
+      if (f) { f.println("millis,temp_c,pressure_hpa,alt_m"); f.close(); }
+    } else if (f) {
+      f.close();
+    }
+  }
+  return true;
+}
+
+void startAP() {
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  if (!ok) {
+    Serial.println("Failed to start AP");
+  } else {
+    Serial.print("AP started. SSID: ");
+    Serial.println(AP_SSID);
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+}
+
+// Append one CSV line
+void logReading(uint32_t now, float tC, float pPa, float altM) {
+  if (!sdInitialized) return;
+  File f = SD.open(LOG_PATH, FILE_APPEND);
+  if (!f) {
+    Serial.println("Failed to open log for append");
+    return;
+  }
+  // Convert Pa to hPa
+  float pHpa = pPa / 100.0f;
+  f.print(now); f.print(",");
+  f.print(tC, 2); f.print(",");
+  f.print(pHpa, 2); f.print(",");
+  f.println(altM, 2);
+  f.close();
+}
+
+// Simple router for three endpoints
+void handleClient(WiFiClient& client, float tC, float pPa, float altM) {
+  // Read request line
+  String req;
+  unsigned long t0 = millis();
+  while (client.connected() && millis() - t0 < 2000) {
+    if (client.available()) {
+      char c = client.read();
+      if (c == '\r') continue;
+      if (c == '\n') break;
+      req += c;
+    }
+  }
+
+  // Very simple route parse
+  String path = "/";
+  int sp1 = req.indexOf(' ');
+  if (sp1 != -1) {
+    int sp2 = req.indexOf(' ', sp1 + 1);
+    if (sp2 != -1) path = req.substring(sp1 + 1, sp2);
+  }
+
+  if (path == "/json") {
+    String body = String("{\"temperature_c\":") + String(tC, 2) +
+                  ",\"pressure_hpa\":" + String(pPa / 100.0f, 2) +
+                  ",\"altitude_m\":" + String(altM, 2) + "}";
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.print("Content-Length: ");
+    client.println(body.length());
+    client.println();
+    client.print(body);
+    return;
+  }
+
+  if (path == "/log") {
+    if (!sdInitialized || !SD.exists(LOG_PATH)) {
+      client.println("HTTP/1.1 404 Not Found");
+      client.println("Content-Type: text/plain");
+      client.println("Connection: close");
+      client.println();
+      client.println("Log not found");
+      return;
+    }
+    File f = SD.open(LOG_PATH, FILE_READ);
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: text/csv");
+    client.println("Connection: close");
+    client.println("Content-Disposition: attachment; filename=\"log.csv\"");
+    client.println();
+    // Stream file
+    uint8_t buf[1024];
+    while (f && f.available()) {
+      size_t n = f.read(buf, sizeof(buf));
+      if (n) client.write(buf, n);
+      else break;
+    }
+    f.close();
+    return;
+  }
+
+  // Default index
+  String html =
+    "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>ESP32 BMP280 Logger</title></head><body>"
+    "<h1>ESP32 BMP280 Logger</h1>"
+    "<p><b>AP SSID:</b> " + String(AP_SSID) + "</p>"
+    "<p><b>Latest:</b><br>"
+    "Temp: " + String(tC, 2) + " &deg;C<br>"
+    "Pressure: " + String(pPa / 100.0f, 2) + " hPa<br>"
+    "Altitude: " + String(altM, 2) + " m</p>"
+    "<p><a href='/json'>/json</a> &middot; <a href='/log'>Download log.csv</a></p>"
+    "</body></html>";
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html; charset=utf-8");
+  client.println("Connection: close");
+  client.print("Content-Length: ");
+  client.println(html.length());
+  client.println();
+  client.print(html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // Start AP and server
+  startAP();
+  server.begin();
+
+  // Init SD and sensor
+  sdInitialized = initSD();
+  sensorInitialized = initBMP280();
+}
+
+void loop() {
+  // Periodic logging
+  uint32_t now = millis();
+  if (sensorInitialized && sdInitialized && (now - lastLog >= LOG_INTERVAL_MS)) {
+    float tC = bmp.readTemperature();
+    float pPa = bmp.readPressure();
+    float altM = bmp.readAltitude(SEA_LEVEL_HPA);
+
+    if (isnan(tC) || isnan(pPa) || isnan(altM)) {
+      Serial.println("Sensor read error; will try re-init");
+      sensorInitialized = initBMP280();
+    } else {
+      logReading(now, tC, pPa, altM);
+      Serial.printf("Logged: %lu ms, %.2f C, %.2f hPa, %.2f m\n",
+                    (unsigned long)now, tC, pPa / 100.0f, altM);
+    }
+    lastLog = now;
+  }
+
+  // Handle client (serve latest reading live)
+  WiFiClient client = server.available();
+  if (client) {
+    // For the page, take a fresh read; fall back to NaNs if not ready
+    float tC = NAN, pPa = NAN, altM = NAN;
+    if (sensorInitialized) {
+      tC = bmp.readTemperature();
+      pPa = bmp.readPressure();
+      altM = bmp.readAltitude(SEA_LEVEL_HPA);
+      if (isnan(tC) || isnan(pPa) || isnan(altM)) {
+        sensorInitialized = initBMP280();
+      }
+    }
+    // If still NaN, provide zeros to avoid 503 on the page
+    if (isnan(tC)) tC = 0; if (isnan(pPa)) pPa = 0; if (isnan(altM)) altM = 0;
+    handleClient(client, tC, pPa, altM);
+    client.stop();
+  }
+}
+
