@@ -1,259 +1,442 @@
-// Here the code combines AP creation, BMP read and SD log
-#include <WiFi.h>
+#include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <SPI.h>
 #include <SD.h>
 #include <Adafruit_BMP280.h>
+#include <math.h>
 
-// ===== AP credentials (password must be >= 8 chars) =====
-const char* AP_SSID     = "ESP32-Logger";
-const char* AP_PASSWORD = "esp32logger";
+// =========================== User Config ===========================
+static const char* AP_SSID = "BMP280-Logger";
+static const char* AP_PASS = "bmp280logger"; // min 8 chars; set "" for open
 
-// ===== Pins =====
+// I2C pins (ESP32 defaults shown)
 static const int I2C_SDA = 21;
 static const int I2C_SCL = 22;
 
-static const int SD_CS   = 5;   // Change if needed (avoid GPIO12)
+// SD SPI pins (ESP32 VSPI defaults: CS=5, SCK=18, MISO=19, MOSI=23)
+static const int SD_CS   = 5;
 static const int SD_SCK  = 18;
 static const int SD_MISO = 19;
 static const int SD_MOSI = 23;
 
-// ===== Sensor/Logging =====
-Adafruit_BMP280 bmp; // I2C
-const float SEA_LEVEL_HPA = 1013.25; // Adjust for better altitude accuracy
+// Sampling/logging rates
+static const float SAMPLE_HZ = 20.0f;  // sensor update
+static const uint32_t LOG_HZ = 1;      // CSV write rate
 
-// Logging interval (ms)
-const uint32_t LOG_INTERVAL_MS = 5000;
-uint32_t lastLog = 0;
+// Filter targets
+static const float DEFAULT_TAU_s = 2.5f;     // EMA time constant (≈ 3τ to 95%)
+// Spike rejection
+static const float MAX_STEP_hPa = 1.0f;      // max per-sample pressure jump allowed
 
-// SD/CSV
-SPIClass spiSD(VSPI);
-const char* LOG_PATH = "/log.csv";
+// BMP280 address probe order
+static const uint8_t AUTOPROBE_ADDRS[2] = {0x76, 0x77};
 
-// Network
-WiFiServer server(80);
+// =========================== Globals ==============================
+Adafruit_BMP280 bmp;
+WebServer server(80);
 
-// State
-bool sensorInitialized = false;
-bool sdInitialized = false;
+// Baseline mode
+enum class BaselineMode : uint8_t { RELATIVE = 0, QNH = 1, KNOWN_ALT = 2 };
+BaselineMode baselineMode = BaselineMode::RELATIVE;
 
-// ---- Helpers ----
-bool initBMP280() {
-  // Try both addresses
-  if (bmp.begin(0x76) || bmp.begin(0x77)) {
-    // Sampling configuration
-    bmp.setSampling(
-      Adafruit_BMP280::MODE_NORMAL,
-      Adafruit_BMP280::SAMPLING_X2,    // temperature oversampling
-      Adafruit_BMP280::SAMPLING_X16,   // pressure oversampling
-      Adafruit_BMP280::FILTER_X16,     // IIR filter
-      Adafruit_BMP280::STANDBY_MS_500  // standby time
-    );
-    Serial.println("BMP280 initialized");
-    return true;
-  }
-  Serial.println("BMP280 not found (0x76/0x77). Check wiring/ADDR.");
-  return false;
+float seaLevel_hPa = 1013.25f;  // derived from mode
+float knownAlt_m   = NAN;        // used when mode = KNOWN_ALT
+
+// Filter state
+float tau_s  = DEFAULT_TAU_s;
+float alpha  = 0.0f;
+float alt_f  = NAN;
+
+// Pressure prefilter (median-of-3)
+float p_hist[3] = {NAN, NAN, NAN};
+uint8_t p_idx   = 0;
+float P_prev    = NAN;
+
+// Timing
+uint32_t tRead_ms  = 0;
+uint32_t tLog_ms   = 0;
+uint32_t read_dtms = (uint32_t)(1000.0f / SAMPLE_HZ);
+uint32_t log_dtms  = (uint32_t)(1000 / LOG_HZ);
+
+// SD logging
+File logFile;
+String logFileName;
+uint32_t linesSinceFlush = 0;
+const uint32_t FLUSH_EVERY_N = 10;
+
+// Latest sample
+struct Sample {
+  uint32_t ms;
+  float tempC;
+  float press_hPa;
+  float alt_m;
+  float alt_filt_m;
+} latest = {0};
+
+// =========================== Utils ================================
+static inline float median3(float a, float b, float c) {
+  // Treat NANs as large to ignore in early startup
+  if (isnan(a)) a = 1e9f;
+  if (isnan(b)) b = 1e9f;
+  if (isnan(c)) c = 1e9f;
+  if (a > b) { float t = a; a = b; b = t; }
+  if (b > c) { float t = b; b = c; c = t; }
+  if (a > b) { float t = a; a = b; b = t; }
+  return b;
 }
 
-bool initSD() {
-  spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, spiSD)) {
-    Serial.println("SD init failed");
-    return false;
-  }
-  Serial.println("SD initialized");
+static inline float clampStep(float current, float prev, float maxStep) {
+  if (isnan(prev)) return current;
+  float d = current - prev;
+  if (d >  maxStep) return prev + maxStep;
+  if (d < -maxStep) return prev - maxStep;
+  return current;
+}
 
-  // Create file and header if new/empty
-  if (!SD.exists(LOG_PATH)) {
-    File f = SD.open(LOG_PATH, FILE_WRITE);
-    if (f) {
-      f.println("millis,temp_c,pressure_hpa,alt_m");
-      f.close();
-      Serial.println("Created new log with header");
-    } else {
-      Serial.println("Failed to create log file");
-      return false;
-    }
-  } else {
-    File f = SD.open(LOG_PATH, FILE_READ);
-    if (f && f.size() == 0) {
-      f.close();
-      f = SD.open(LOG_PATH, FILE_WRITE);
-      if (f) { f.println("millis,temp_c,pressure_hpa,alt_m"); f.close(); }
-    } else if (f) {
-      f.close();
-    }
+// Barometric conversions
+static inline float pressureToAltitude(float P_hPa, float P0_hPa) {
+  return 44330.0f * (1.0f - powf(P_hPa / P0_hPa, 0.1903f));
+}
+static inline float seaLevelFromKnownAlt(float P_hPa, float h_m) {
+  return P_hPa * powf(1.0f - (h_m / 44330.0f), -1.0f / 0.1903f);
+}
+
+static void computeAlpha() {
+  float dt_s = read_dtms / 1000.0f;
+  alpha = 1.0f - expf(-dt_s / tau_s);
+}
+
+// Create new log file with incrementing index
+static String nextLogFileName() {
+  uint16_t idx = 1;
+  while (idx < 10000) {
+    String name = String("log_") + String(idx, 10) + String(".csv");
+    if (!SD.exists(name)) return name;
+    idx++;
   }
+  return String("log.csv"); // fallback
+}
+
+static bool openNewLogFile() {
+  if (logFile) logFile.close();
+  logFileName = nextLogFileName();
+  logFile = SD.open(logFileName, FILE_WRITE);
+  if (!logFile) return false;
+  logFile.println("millis,temp_c,pressure_hpa,altitude_m,altitude_filt_m,mode,sea_level_hpa,tau_s");
+  linesSinceFlush = 0;
   return true;
 }
 
-void startAP() {
-  WiFi.mode(WIFI_AP);
-  bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD);
-  if (!ok) {
-    Serial.println("Failed to start AP");
-  } else {
-    Serial.print("AP started. SSID: ");
-    Serial.println(AP_SSID);
-    Serial.print("AP IP: ");
-    Serial.println(WiFi.softAPIP());
+static void logSampleCSV(const Sample& s) {
+  if (!logFile) return;
+  logFile.print(s.ms);
+  logFile.print(",");
+  logFile.print(s.tempC, 2);
+  logFile.print(",");
+  logFile.print(s.press_hPa, 2);
+  logFile.print(",");
+  logFile.print(s.alt_m, 2);
+  logFile.print(",");
+  logFile.print(s.alt_filt_m, 2);
+  logFile.print(",");
+  logFile.print((int)baselineMode);
+  logFile.print(",");
+  logFile.print(seaLevel_hPa, 2);
+  logFile.print(",");
+  logFile.println(tau_s, 2);
+
+  if (++linesSinceFlush >= FLUSH_EVERY_N) {
+    logFile.flush();
+    linesSinceFlush = 0;
   }
 }
 
-// Append one CSV line
-void logReading(uint32_t now, float tC, float pPa, float altM) {
-  if (!sdInitialized) return;
-  File f = SD.open(LOG_PATH, FILE_APPEND);
-  if (!f) {
-    Serial.println("Failed to open log for append");
+// ======================= HTTP Handlers ============================
+static void handleRoot() {
+  String ip = WiFi.softAPIP().toString();
+  String html =
+    String("<!doctype html><html><head><meta charset='utf-8'/>")
+    + "<title>BMP280 Logger</title>"
+    + "<style>body{font-family:system-ui;margin:20px} code{background:#f3f3f3;padding:2px 4px;border-radius:4px}</style>"
+    + "</head><body>"
+    + "<h1>BMP280 Logger</h1>"
+    + "<p>AP IP: <b>" + ip + "</b></p>"
+    + "<ul>"
+    + "<li><a href='/status'>/status</a> (JSON)</li>"
+    + "<li><a href='/latest.json'>/latest.json</a></li>"
+    + "<li><a href='/data.csv'>/data.csv</a></li>"
+    + "<li><a href='/list'>/list</a></li>"
+    + "<li><a href='/newlog'>/newlog</a> (start a new log file)</li>"
+    + "</ul>"
+    + "<h3>Configure baseline/filter</h3>"
+    + "<p>Examples:</p>"
+    + "<ul>"
+    + "<li>Relative (auto): <code>/config?mode=relative</code></li>"
+    + "<li>Fixed QNH: <code>/config?mode=qnh&value=1010.5</code></li>"
+    + "<li>Known altitude: <code>/config?mode=alt&value=15</code> (meters)</li>"
+    + "<li>Set filter tau (s): <code>/config?tau=2.0</code></li>"
+    + "</ul>"
+    + "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+static void handleStatus() {
+  String s = "{";
+  s += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  s += "\"ssid\":\"" + String(AP_SSID) + "\",";
+  s += "\"sd\":" + String((bool)logFile ? "true" : "false") + ",";
+  s += "\"log_file\":\"" + logFileName + "\",";
+  s += "\"uptime_ms\":" + String(millis()) + ",";
+  s += "\"baseline_mode\":" + String((int)baselineMode) + ",";
+  s += "\"sea_level_hpa\":" + String(seaLevel_hPa, 2) + ",";
+  s += "\"tau_s\":" + String(tau_s, 2) + ",";
+  s += "\"sample_hz\":" + String(SAMPLE_HZ, 2) + ",";
+  s += "\"log_hz\":" + String(1000.0f / log_dtms, 2);
+  s += "}";
+  server.send(200, "application/json", s);
+}
+
+static void handleLatest() {
+  String s = "{";
+  s += "\"millis\":" + String(latest.ms) + ",";
+  s += "\"temperature_c\":" + String(latest.tempC, 2) + ",";
+  s += "\"pressure_hpa\":" + String(latest.press_hPa, 2) + ",";
+  s += "\"altitude_m\":" + String(latest.alt_m, 2) + ",";
+  s += "\"altitude_filt_m\":" + String(latest.alt_filt_m, 2) + ",";
+  s += "\"sea_level_hpa\":" + String(seaLevel_hPa, 2) + ",";
+  s += "\"mode\":" + String((int)baselineMode);
+  s += "}";
+  server.send(200, "application/json", s);
+}
+
+static void handleDataCSV() {
+  if (!SD.exists(logFileName)) {
+    server.send(404, "text/plain", "No log file");
     return;
   }
-  // Convert Pa to hPa
-  float pHpa = pPa / 100.0f;
-  f.print(now); f.print(",");
-  f.print(tC, 2); f.print(",");
-  f.print(pHpa, 2); f.print(",");
-  f.println(altM, 2);
+  File f = SD.open(logFileName, FILE_READ);
+  if (!f) { server.send(500, "text/plain", "Open failed"); return; }
+  server.streamFile(f, "text/csv");
   f.close();
 }
 
-// Simple router for three endpoints
-void handleClient(WiFiClient& client, float tC, float pPa, float altM) {
-  // Read request line
-  String req;
-  unsigned long t0 = millis();
-  while (client.connected() && millis() - t0 < 2000) {
-    if (client.available()) {
-      char c = client.read();
-      if (c == '\r') continue;
-      if (c == '\n') break;
-      req += c;
-    }
+static void handleList() {
+  File root = SD.open("/");
+  if (!root) { server.send(500, "text/plain", "SD open failed"); return; }
+  String s = "Files:\n";
+  File f = root.openNextFile();
+  while (f) {
+    s += String(f.name()) + " (" + String(f.size()) + " bytes)\n";
+    f = root.openNextFile();
   }
-
-  // Very simple route parse
-  String path = "/";
-  int sp1 = req.indexOf(' ');
-  if (sp1 != -1) {
-    int sp2 = req.indexOf(' ', sp1 + 1);
-    if (sp2 != -1) path = req.substring(sp1 + 1, sp2);
-  }
-
-  if (path == "/json") {
-    String body = String("{\"temperature_c\":") + String(tC, 2) +
-                  ",\"pressure_hpa\":" + String(pPa / 100.0f, 2) +
-                  ",\"altitude_m\":" + String(altM, 2) + "}";
-    client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: application/json");
-    client.println("Connection: close");
-    client.print("Content-Length: ");
-    client.println(body.length());
-    client.println();
-    client.print(body);
-    return;
-  }
-
-  if (path == "/log") {
-    if (!sdInitialized || !SD.exists(LOG_PATH)) {
-      client.println("HTTP/1.1 404 Not Found");
-      client.println("Content-Type: text/plain");
-      client.println("Connection: close");
-      client.println();
-      client.println("Log not found");
-      return;
-    }
-    File f = SD.open(LOG_PATH, FILE_READ);
-    client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: text/csv");
-    client.println("Connection: close");
-    client.println("Content-Disposition: attachment; filename=\"log.csv\"");
-    client.println();
-    // Stream file
-    uint8_t buf[1024];
-    while (f && f.available()) {
-      size_t n = f.read(buf, sizeof(buf));
-      if (n) client.write(buf, n);
-      else break;
-    }
-    f.close();
-    return;
-  }
-
-  // Default index
-  String html =
-    "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>ESP32 BMP280 Logger</title></head><body>"
-    "<h1>ESP32 BMP280 Logger</h1>"
-    "<p><b>AP SSID:</b> " + String(AP_SSID) + "</p>"
-    "<p><b>Latest:</b><br>"
-    "Temp: " + String(tC, 2) + " &deg;C<br>"
-    "Pressure: " + String(pPa / 100.0f, 2) + " hPa<br>"
-    "Altitude: " + String(altM, 2) + " m</p>"
-    "<p><a href='/json'>/json</a> &middot; <a href='/log'>Download log.csv</a></p>"
-    "</body></html>";
-
-  client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: text/html; charset=utf-8");
-  client.println("Connection: close");
-  client.print("Content-Length: ");
-  client.println(html.length());
-  client.println();
-  client.print(html);
+  root.close();
+  server.send(200, "text/plain", s);
 }
 
+static void handleDownload() {
+  if (!server.hasArg("file")) { server.send(400, "text/plain", "Need ?file="); return; }
+  String name = server.arg("file");
+  if (!SD.exists(name)) { server.send(404, "text/plain", "Not found"); return; }
+  File f = SD.open(name, FILE_READ);
+  if (!f) { server.send(500, "text/plain", "Open failed"); return; }
+  server.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
+static void handleNewLog() {
+  if (!openNewLogFile()) {
+    server.send(500, "text/plain", "Failed to create log file");
+    return;
+  }
+  server.send(200, "text/plain", "New log file: " + logFileName);
+}
+
+static void handleConfig() {
+  bool changed = false;
+
+  if (server.hasArg("tau")) {
+    float t = server.arg("tau").toFloat();
+    if (t > 0.2f && t < 30.0f) { tau_s = t; computeAlpha(); changed = true; }
+  }
+
+  if (server.hasArg("mode")) {
+    String m = server.arg("mode");
+    if (m == "relative") { baselineMode = BaselineMode::RELATIVE; changed = true; }
+    else if (m == "qnh")  { baselineMode = BaselineMode::QNH;    changed = true; }
+    else if (m == "alt")  { baselineMode = BaselineMode::KNOWN_ALT; changed = true; }
+  }
+
+  if (server.hasArg("value")) {
+    float v = server.arg("value").toFloat();
+    if (baselineMode == BaselineMode::QNH && v > 800 && v < 1100) {
+      seaLevel_hPa = v; changed = true;
+    } else if (baselineMode == BaselineMode::KNOWN_ALT && v > -200.0f && v < 9000.0f) {
+      knownAlt_m = v; changed = true;
+    }
+  }
+
+  // Recompute seaLevel if needed from current pressure
+  if (changed) {
+    float P_now = bmp.readPressure() / 100.0f;
+    if (baselineMode == BaselineMode::RELATIVE) {
+      seaLevel_hPa = P_now;
+    } else if (baselineMode == BaselineMode::KNOWN_ALT && !isnan(knownAlt_m)) {
+      seaLevel_hPa = seaLevelFromKnownAlt(P_now, knownAlt_m);
+    }
+    // Re-anchor filtered altitude to avoid long transients
+    float alt_now = pressureToAltitude(P_now, seaLevel_hPa);
+    alt_f = alt_now;
+  }
+
+  handleStatus();
+}
+
+// =========================== Setup ================================
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  delay(200);
 
   // I2C
   Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
 
-  // Start AP and server
-  startAP();
-  server.begin();
-
-  // Init SD and sensor
-  sdInitialized = initSD();
-  sensorInitialized = initBMP280();
-}
-
-void loop() {
-  // Periodic logging
-  uint32_t now = millis();
-  if (sensorInitialized && sdInitialized && (now - lastLog >= LOG_INTERVAL_MS)) {
-    float tC = bmp.readTemperature();
-    float pPa = bmp.readPressure();
-    float altM = bmp.readAltitude(SEA_LEVEL_HPA);
-
-    if (isnan(tC) || isnan(pPa) || isnan(altM)) {
-      Serial.println("Sensor read error; will try re-init");
-      sensorInitialized = initBMP280();
-    } else {
-      logReading(now, tC, pPa, altM);
-      Serial.printf("Logged: %lu ms, %.2f C, %.2f hPa, %.2f m\n",
-                    (unsigned long)now, tC, pPa / 100.0f, altM);
-    }
-    lastLog = now;
+  // BMP280 init + config
+  bool ok = false;
+  for (uint8_t i = 0; i < 2 && !ok; ++i) {
+    ok = bmp.begin(AUTOPROBE_ADDRS[i]);
+  }
+  if (!ok) {
+    Serial.println("BMP280 not found at 0x76/0x77");
+    while (1) delay(1000);
   }
 
-  // Handle client (serve latest reading live)
-  WiFiClient client = server.available();
-  if (client) {
-    // For the page, take a fresh read; fall back to NaNs if not ready
-    float tC = NAN, pPa = NAN, altM = NAN;
-    if (sensorInitialized) {
-      tC = bmp.readTemperature();
-      pPa = bmp.readPressure();
-      altM = bmp.readAltitude(SEA_LEVEL_HPA);
-      if (isnan(tC) || isnan(pPa) || isnan(altM)) {
-        sensorInitialized = initBMP280();
-      }
+  // Fast, clean ground-level config: T×2, P×16, IIR×4, standby 20 ms
+  bmp.setSampling(
+    Adafruit_BMP280::MODE_NORMAL,
+    Adafruit_BMP280::SAMPLING_X2,   // temperature oversampling
+    Adafruit_BMP280::SAMPLING_X16,  // pressure oversampling
+    Adafruit_BMP280::FILTER_X4,     // moderate IIR
+    Adafruit_BMP280::STANDBY_MS_30  // ~20–23 Hz effective ODR
+  );
+
+  // SD
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD init failed");
+    // Continue without SD to allow live telemetry
+  } else if (!openNewLogFile()) {
+    Serial.println("SD open file failed");
+  } else {
+    Serial.print("Logging to: ");
+    Serial.println(logFileName);
+  }
+
+  // Baseline calibration (3 s average)
+  Serial.println("Calibrating baseline (keep still)...");
+  delay(300);
+  uint32_t t0 = millis();
+  double sumP = 0.0;
+  uint16_t n = 0;
+  while (millis() - t0 < 3000) {
+    sumP += bmp.readPressure() / 100.0f;
+    n++;
+    delay(10);
+  }
+  float P0 = (n ? (float)(sumP / n) : 1013.25f);
+
+  // Default baseline mode: RELATIVE
+  if (baselineMode == BaselineMode::RELATIVE) {
+    seaLevel_hPa = P0;
+  }
+
+  // Filters
+  computeAlpha();
+  float alt0 = pressureToAltitude(P0, seaLevel_hPa);
+  alt_f = alt0;
+  P_prev = P0;
+
+  // Wi‑Fi AP
+  WiFi.mode(WIFI_AP);
+  bool apok = WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.print("AP ");
+  Serial.println(apok ? "started." : "failed.");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Routes
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/latest.json", handleLatest);
+  server.on("/data.csv", handleDataCSV);
+  server.on("/list", handleList);
+  server.on("/download", handleDownload);
+  server.on("/newlog", handleNewLog);
+  server.on("/config", handleConfig);
+  server.begin();
+
+  // Schedules
+  uint32_t now = millis();
+  tRead_ms = now;
+  tLog_ms  = now;
+  Serial.println("TempC,Pressure_hPa,Alt_m,AltFilt_m");
+}
+
+// ============================ Loop ================================
+void loop() {
+  server.handleClient();
+
+  uint32_t now = millis();
+
+  // Sensor read/update @ SAMPLE_HZ
+  if (now - tRead_ms >= read_dtms) {
+    tRead_ms += read_dtms;
+
+    float tempC = bmp.readTemperature();
+    float P_hPa = bmp.readPressure() / 100.0f;
+
+    // Baseline recompute for KNOWN_ALT (keeps up with weather drift)
+    if (baselineMode == BaselineMode::KNOWN_ALT && !isnan(knownAlt_m)) {
+      seaLevel_hPa = seaLevelFromKnownAlt(P_hPa, knownAlt_m);
     }
-    // If still NaN, provide zeros to avoid 503 on the page
-    if (isnan(tC)) tC = 0; if (isnan(pPa)) pPa = 0; if (isnan(altM)) altM = 0;
-    handleClient(client, tC, pPa, altM);
-    client.stop();
+
+    // Prefilter: median-of-3 + step clamp
+    p_hist[p_idx] = P_hPa;
+    p_idx = (p_idx + 1) % 3;
+    float P_med   = median3(p_hist[0], p_hist[1], p_hist[2]);
+    float P_clean = clampStep(P_med, P_prev, MAX_STEP_hPa);
+    P_prev = P_clean;
+
+    // Altitude
+    float alt = pressureToAltitude(P_clean, seaLevel_hPa);
+
+    // EMA filter with target tau
+    if (isnan(alt_f)) alt_f = alt;
+    alt_f = (1.0f - alpha) * alt_f + alpha * alt;
+
+    // Update latest
+    latest.ms         = now;
+    latest.tempC      = tempC;
+    latest.press_hPa  = P_clean;
+    latest.alt_m      = alt;
+    latest.alt_filt_m = alt_f;
+
+    // Optional serial preview at ~5 Hz
+    static uint32_t tPrint = 0;
+    if (now - tPrint >= 200) {
+      tPrint = now;
+      Serial.print(latest.tempC, 2);  Serial.print(",");
+      Serial.print(latest.press_hPa, 2); Serial.print(",");
+      Serial.print(latest.alt_m, 2);  Serial.print(",");
+      Serial.println(latest.alt_filt_m, 2);
+    }
+  }
+
+  // Logging @ LOG_HZ
+  if (now - tLog_ms >= log_dtms) {
+    tLog_ms += log_dtms;
+    logSampleCSV(latest);
   }
 }
 
