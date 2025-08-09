@@ -1,0 +1,168 @@
+#include <Wire.h>
+#include <MPU6500_WE.h>
+
+// Try 0x68 then 0x69
+#define MPU_ADDR_A 0x68
+#define MPU_ADDR_B 0x69
+
+MPU6500_WE* imu = nullptr;
+
+// Filter parameters
+const float alpha = 0.2;  // Low-pass smoothing (0.1–0.5)
+float filteredAccX = 0, filteredAccY = 0, filteredAccZ = 0;
+float filteredGyrX = 0, filteredGyrY = 0, filteredGyrZ = 0;
+
+// Calibration offsets
+float accelOffsetX = 0, accelOffsetY = 0, accelOffsetZ = 0;
+float gyroOffsetX  = 0, gyroOffsetY  = 0, gyroOffsetZ  = 0;
+
+// Complementary filter (optional)
+bool useComplementary = true;
+float roll_deg = 0.0f, pitch_deg = 0.0f;
+unsigned long lastMicros = 0;
+
+bool initIMU(uint8_t addr) {
+  if (imu) { delete imu; imu = nullptr; }
+  imu = new MPU6500_WE(addr);
+  if (!imu->init()) return false;
+
+  imu->setAccRange(MPU6500_ACC_RANGE_8G);
+  imu->setGyrRange(MPU6500_GYRO_RANGE_500);
+
+  imu->setSampleRateDivider(5);          // You had this
+  imu->setAccDLPF(MPU6500_DLPF_4);       // ~21 Hz accel bandwidth
+  imu->enableAccDLPF(true);
+  imu->setGyrDLPF(MPU6500_DLPF_4);       // Add gyro DLPF too
+  imu->enableGyrDLPF(true);
+
+  return true;
+}
+
+void calibrateSensors() {
+  Serial.println("Calibrating... Keep sensor flat and still!");
+  delay(3000);
+
+  const int samples = 200;
+  float sumAccX = 0, sumAccY = 0, sumAccZ = 0;
+  float sumGyrX = 0, sumGyrY = 0, sumGyrZ = 0;
+
+  for (int i = 0; i < samples; i++) {
+    xyzFloat accRaw = imu->getAccRawValues();
+    xyzFloat gyrRaw = imu->getGyrRawValues();
+
+    sumAccX += accRaw.x;
+    sumAccY += accRaw.y;
+    sumAccZ += accRaw.z;
+
+    sumGyrX += gyrRaw.x;
+    sumGyrY += gyrRaw.y;
+    sumGyrZ += gyrRaw.z;
+    delay(5);
+  }
+
+  accelOffsetX = sumAccX / samples;
+  accelOffsetY = sumAccY / samples;
+  // Expect +1g on Z in your calibration orientation; 1g = 4096 LSB at ±8g
+  accelOffsetZ = (sumAccZ / samples) - 4096.0f;
+
+  gyroOffsetX = sumGyrX / samples;
+  gyroOffsetY = sumGyrY / samples;
+  gyroOffsetZ = sumGyrZ / samples;
+
+  Serial.println("Calibration complete!");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
+  // Address fallback
+  if (!initIMU(MPU_ADDR_A)) {
+    Serial.println("Init 0x68 failed, trying 0x69...");
+    if (!initIMU(MPU_ADDR_B)) {
+      Serial.println("MPU6500 init failed (0x68/0x69). Check wiring/AD0.");
+      while (1) { delay(1000); }
+    }
+  }
+  Serial.println("MPU6500 Connected!");
+
+  calibrateSensors();
+
+  Serial.println("AccX,AccY,AccZ,GyrX,GyrY,GyrZ"); // Serial Plotter header
+  lastMicros = micros();
+}
+
+void loop() {
+  // Read raw sensor values
+  xyzFloat accRaw = imu->getAccRawValues();
+  xyzFloat gyrRaw = imu->getGyrRawValues();
+
+  // Apply calibration offsets
+  float accX = accRaw.x - accelOffsetX;
+  float accY = accRaw.y - accelOffsetY;
+  float accZ = accRaw.z - accelOffsetZ;
+
+  float gyrX = gyrRaw.x - gyroOffsetX;
+  float gyrY = gyrRaw.y - gyroOffsetY;
+  float gyrZ = gyrRaw.z - gyroOffsetZ;
+
+  // Convert to proper units
+  float accX_g = accX / 4096.0f;   // ±8g
+  float accY_g = accY / 4096.0f;
+  float accZ_g = accZ / 4096.0f;
+
+  float gyrX_dps = gyrX / 65.5f;   // ±500 dps
+  float gyrY_dps = gyrY / 65.5f;
+  float gyrZ_dps = gyrZ / 65.5f;
+
+  // Convert acceleration to m/s²
+  const float g_ms2 = 9.80665f;
+  float accX_ms2 = accX_g * g_ms2;
+  float accY_ms2 = accY_g * g_ms2;
+  float accZ_ms2 = accZ_g * g_ms2;
+
+  // Low-pass filter
+  filteredAccX = (1 - alpha) * filteredAccX + alpha * accX_ms2;
+  filteredAccY = (1 - alpha) * filteredAccY + alpha * accY_ms2;
+  filteredAccZ = (1 - alpha) * filteredAccZ + alpha * accZ_ms2;
+
+  filteredGyrX = (1 - alpha) * filteredGyrX + alpha * gyrX_dps;
+  filteredGyrY = (1 - alpha) * filteredGyrY + alpha * gyrY_dps;
+  filteredGyrZ = (1 - alpha) * filteredGyrZ + alpha * gyrZ_dps;
+
+  // Optional: complementary filter for roll/pitch
+  if (useComplementary) {
+    unsigned long nowUs = micros();
+    float dt = (nowUs - lastMicros) / 1e6f;
+    lastMicros = nowUs;
+
+    // Accel tilt estimate (degrees)
+    float roll_acc  = atan2f(accY_ms2, sqrtf(accX_ms2*accX_ms2 + accZ_ms2*accZ_ms2)) * 57.29578f;
+    float pitch_acc = atan2f(-accX_ms2, sqrtf(accY_ms2*accY_ms2 + accZ_ms2*accZ_ms2)) * 57.29578f;
+
+    // Integrate gyro
+    float roll_gyro  = roll_deg  + gyrX_dps * dt;
+    float pitch_gyro = pitch_deg + gyrY_dps * dt;
+
+    // Fuse (0.98/0.02 is a good start)
+    const float k = 0.98f;
+    roll_deg  = k * roll_gyro  + (1 - k) * roll_acc;
+    pitch_deg = k * pitch_gyro + (1 - k) * pitch_acc;
+  }
+
+  // Serial Plotter output (CSV)
+  Serial.print(filteredAccX); Serial.print(",");
+  Serial.print(filteredAccY); Serial.print(",");
+  Serial.print(filteredAccZ); Serial.print(",");
+  Serial.print(filteredGyrX); Serial.print(",");
+  Serial.print(filteredGyrY); Serial.print(",");
+  Serial.println(filteredGyrZ);
+
+  // For debugging angles, uncomment:
+  // Serial.printf("Roll: %.2f deg, Pitch: %.2f deg\n", roll_deg, pitch_deg);
+
+  delay(50); // ~20 Hz
+}
