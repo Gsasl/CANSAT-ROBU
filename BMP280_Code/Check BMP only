@@ -1,0 +1,89 @@
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+
+//=============================================================================
+// Configuration
+//=============================================================================
+#define SDA_PIN    21    // ESP32 SDA pin
+#define SCL_PIN    22    // ESP32 SCL pin
+
+Adafruit_BMP280 bmp;     // I2C interface
+uint8_t       bmpAddr;   // Detected I2C address
+
+//=============================================================================
+// Helper: Scan the I²C Bus and print any found addresses
+//=============================================================================
+void i2cScan() {
+  Serial.println("\nI²C Bus Scan Starting…");
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print(" • Found device at 0x");
+      if (addr < 16) Serial.print('0');
+      Serial.println(addr, HEX);
+    }
+  }
+  Serial.println("I²C Bus Scan Complete\n");
+}
+
+//=============================================================================
+// Helper: Try both BMP280 addresses and return the one that works
+// Returns 0 if neither 0x76 nor 0x77 succeeded
+//=============================================================================
+uint8_t detectBMP280() {
+  const uint8_t candidates[] = { 0x76, 0x77 };
+  for (uint8_t addr : candidates) {
+    if (bmp.begin(addr)) {
+      return addr;
+    }
+  }
+  return 0;
+}
+
+//=============================================================================
+// Arduino Setup
+//=============================================================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(1);
+
+  // Initialize I²C with chosen pins
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // OPTIONAL: comment this out once you know the address
+  i2cScan();
+
+  // Detect BMP280 at 0x76 or 0x77
+  bmpAddr = detectBMP280();
+  if (!bmpAddr) {
+    Serial.println("ERROR: BMP280 not found at 0x76 or 0x77");
+    Serial.println("  • Check wiring (SDA/SCL pull-ups, 3.3V, GND)");
+    while (true) delay(10);
+  }
+  
+  Serial.print("BMP280 initialized at 0x");
+  Serial.println(bmpAddr, HEX);
+}
+
+//=============================================================================
+// Arduino Main Loop
+//=============================================================================
+void loop() {
+  // Read temperature (°C) and pressure (Pa)
+  float temperature = bmp.readTemperature();
+  float pressure    = bmp.readPressure() / 100.0F; // convert to hPa
+
+  // Check for failed reads (nan)
+  if (isnan(temperature) || isnan(pressure)) {
+    Serial.println("Read failed! Check sensor wiring & address.");
+  } else {
+    Serial.print("Temp: ");
+    Serial.print(temperature, 2);
+    Serial.print(" °C   Pressure: ");
+    Serial.print(pressure, 2);
+    Serial.println(" hPa");
+  }
+
+  delay(2000);
+}
+
