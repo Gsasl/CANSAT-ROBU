@@ -1,0 +1,354 @@
+/*
+  ESP32 USB-B sender: BMP280 + DHT11 @1Hz
+  - Posts JSON to AP at http://192.168.4.1/ingest
+  - Buffers last 46 samples
+  - Serves /export46.html with a table + inline SVG graphs (no external deps)
+*/
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <Adafruit_BMP280.h>
+#include <DHT.h>
+
+// ---------- Wi-Fi/AP settings ----------
+#define WIFI_SSID "ESP32-Test-AP"      // your SoftAP SSID
+#define WIFI_PASS ""                    // password if any
+#define POST_URL "http://192.168.4.1/ingest"
+
+// ---------- Pins and sensors ----------
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define DHT_PIN 27
+#define DHT_TYPE DHT11
+
+Adafruit_BMP280 bmp;                    // I2C
+const uint8_t BMP_ADDR_1 = 0x76;
+const uint8_t BMP_ADDR_2 = 0x77;
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ---------- Timing ----------
+const unsigned long sampleIntervalMs = 1000; // 1 Hz (DHT11 max)
+unsigned long nextSampleAt = 0;
+int seq = 0;
+
+// ---------- Buffer for 46-sec export ----------
+struct Sample {
+  uint32_t t_ms;
+  float bmp_temp_c;
+  float pressure_hpa;
+  float dht_hum_pct;
+  float dht_temp_c;
+};
+
+const int BUFSZ = 46;
+Sample ring[BUFSZ];
+int ringCount = 0;
+int ringHead = 0; // next write index
+
+// ---------- HTTP server for export ----------
+WebServer server(80);
+
+// ---------- Helpers ----------
+bool connectWiFiOnce(unsigned long timeoutMs = 15000) {
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to AP");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    Serial.print(".");
+    delay(250);
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected! STA IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  } else {
+    Serial.println("Wi-Fi connect timeout");
+    return false;
+  }
+}
+
+static inline bool finite(float x) { return !isnan(x) && isfinite(x); }
+
+void bufferSample(const Sample& s) {
+  ring[ringHead] = s;
+  ringHead = (ringHead + 1) % BUFSZ;
+  if (ringCount < BUFSZ) ringCount++;
+}
+
+void addPolyline(String& svg, const float* vals, int n, float vmin, float vmax,
+                 int x0, int y0, int width, int height, const char* color, bool dash=false) {
+  if (n <= 1 || !(finite(vmin) && finite(vmax))) return;
+  float span = vmax - vmin;
+  if (span <= 0.0001f) { vmin -= 0.5f; vmax += 0.5f; span = vmax - vmin; }
+  float stepX = (n > 1) ? (float)width / (n - 1) : width;
+  svg += "<polyline fill=\"none\" stroke=\"";
+  svg += color;
+  svg += "\" stroke-width=\"2\"";
+  if (dash) svg += " stroke-dasharray=\"4,3\"";
+  svg += " points=\"";
+  for (int i = 0; i < n; i++) {
+    float v = vals[i];
+    if (!finite(v)) continue;
+    float x = x0 + i * stepX;
+    float y = y0 + height - ((v - vmin) / span) * height;
+    svg += String(x, 1); svg += ","; svg += String(y, 1); svg += " ";
+  }
+  svg += "\"/>\n";
+}
+
+void minMax(const float* vals, int n, float& vmin, float& vmax) {
+  vmin = NAN; vmax = NAN;
+  for (int i = 0; i < n; i++) {
+    float v = vals[i];
+    if (!finite(v)) continue;
+    if (!finite(vmin) || v < vmin) vmin = v;
+    if (!finite(vmax) || v > vmax) vmax = v;
+  }
+}
+
+void handleRoot() {
+  String s = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  s += "<title>ESP32 Sender</title><style>body{font-family:Inter,Arial,sans-serif;padding:16px}a{color:#0b5}code{background:#f5f5f5;padding:2px 4px;border-radius:4px}</style></head><body>";
+  s += "<h2>ESP32 Sender</h2>";
+  s += "<p>Last 46s export: <a href='/export46.html'>export46.html</a></p>";
+  s += "<p>Samples buffered: " + String(ringCount) + " / " + String(BUFSZ) + "</p>";
+  s += "<p>Posting to <code>" POST_URL "</code></p>";
+  s += "</body></html>";
+  server.send(200, "text/html; charset=utf-8", s);
+}
+
+void handleExport46Html() {
+  // Collect snapshot oldest->newest
+  int n = ringCount;
+  Sample tmp[BUFSZ];
+  for (int i = 0; i < n; i++) {
+    int idx = (ringHead - ringCount + i + BUFSZ) % BUFSZ;
+    tmp[i] = ring[idx];
+  }
+  // Build arrays for charting
+  static float a_bmpT[BUFSZ], a_dhtT[BUFSZ], a_hum[BUFSZ], a_pres[BUFSZ];
+  for (int i = 0; i < n; i++) {
+    a_bmpT[i] = tmp[i].bmp_temp_c;
+    a_dhtT[i] = tmp[i].dht_temp_c;
+    a_hum[i]  = tmp[i].dht_hum_pct;
+    a_pres[i] = tmp[i].pressure_hpa;
+  }
+  float bmpTmin, bmpTmax, dhtTmin, dhtTmax, humMin, humMax, pMin, pMax;
+  minMax(a_bmpT, n, bmpTmin, bmpTmax);
+  minMax(a_dhtT, n, dhtTmin, dhtTmax);
+  minMax(a_hum,  n, humMin,   humMax);
+  minMax(a_pres, n, pMin,     pMax);
+
+  // HTML head
+  String s;
+  s.reserve(24000);
+  s += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  s += "<title>46-second export</title>";
+  s += "<style>";
+  s += "body{font-family:Inter,Arial,sans-serif;margin:16px}";
+  s += "h2{margin:8px 0 12px} .meta{color:#666;margin-bottom:10px}";
+  s += "table{border-collapse:collapse;width:100%;font-size:14px} th,td{border:1px solid #ddd;padding:6px 8px;text-align:right}";
+  s += "th{background:#f7f7f7;text-align:center} tr:nth-child(even){background:#fafafa}";
+  s += ".k{font-weight:600;color:#333} .legend{margin:6px 0 14px}";
+  s += ".box{border:1px solid #e0e0e0;border-radius:8px;padding:10px;margin-bottom:14px}";
+  s += ".note{color:#666;font-size:12px}";
+  s += "</style></head><body>";
+  s += "<h2>46-second export</h2>";
+  s += "<div class='meta'>Samples: " + String(n) + " of 46 · Generated by ESP32 sender</div>";
+
+  // SVG charts (inline, no CDN)
+  int W = 760, H = 320, pad = 40;
+  int plotW = W - pad*2;
+  int plotH = (H - pad*2) / 3 - 10;
+  s += "<div class='box'><div class='legend'>";
+  s += "<span class='k'>Graphs:</span> ";
+  s += "<span style='color:#e63946'>BMP Temp</span>, ";
+  s += "<span style='color:#457b9d'>DHT Temp</span> · ";
+  s += "<span style='color:#2a9d8f'>Humidity</span> · ";
+  s += "<span style='color:#6d597a'>Pressure</span>";
+  s += "</div>";
+  s += "<svg width='" + String(W) + "' height='" + String(H) + "' viewBox='0 0 " + String(W) + " " + String(H) + "'>";
+  // Temperature panel
+  int x0 = pad, y0 = pad;
+  s += "<g>";
+  s += "<text x='" + String(x0) + "' y='" + String(y0 - 10) + "' fill='#333' font-size='12'>Temperature (°C)</text>";
+  s += "<rect x='" + String(x0) + "' y='" + String(y0) + "' width='" + String(plotW) + "' height='" + String(plotH) + "' fill='#fff' stroke='#ddd'/>";
+  float tMin = bmpTmin; float tMax = bmpTmax;
+  if (finite(dhtTmin)) { if (!finite(tMin) || dhtTmin < tMin) tMin = dhtTmin; if (!finite(tMax) || dhtTmax > tMax) tMax = dhtTmax; }
+  // grid lines
+  for (int g=0; g<=4; g++) {
+    float gy = y0 + plotH * g / 4.0f;
+    s += "<line x1='" + String(x0) + "' y1='" + String(gy) + "' x2='" + String(x0+plotW) + "' y2='" + String(gy) + "' stroke='#eee'/>";
+  }
+  addPolyline(s, a_bmpT, n, tMin, tMax, x0, y0, plotW, plotH, "#e63946", false);
+  addPolyline(s, a_dhtT, n, tMin, tMax, x0, y0, plotW, plotH, "#457b9d", true);
+  if (finite(tMin) && finite(tMax)) {
+    s += "<text x='" + String(x0+plotW+5) + "' y='" + String(y0+8) + "' fill='#555' font-size='11'>" + String(tMax,1) + "</text>";
+    s += "<text x='" + String(x0+plotW+5) + "' y='" + String(y0+plotH) + "' fill='#555' font-size='11'>" + String(tMin,1) + "</text>";
+  }
+  s += "</g>";
+  // Humidity panel
+  y0 = pad + plotH + 30;
+  s += "<g>";
+  s += "<text x='" + String(x0) + "' y='" + String(y0 - 10) + "' fill='#333' font-size='12'>Humidity (%)</text>";
+  s += "<rect x='" + String(x0) + "' y='" + String(y0) + "' width='" + String(plotW) + "' height='" + String(plotH) + "' fill='#fff' stroke='#ddd'/>";
+  for (int g=0; g<=4; g++) {
+    float gy = y0 + plotH * g / 4.0f;
+    s += "<line x1='" + String(x0) + "' y1='" + String(gy) + "' x2='" + String(x0+plotW) + "' y2='" + String(gy) + "' stroke='#eee'/>";
+  }
+  addPolyline(s, a_hum, n, humMin, humMax, x0, y0, plotW, plotH, "#2a9d8f", false);
+  if (finite(humMin) && finite(humMax)) {
+    s += "<text x='" + String(x0+plotW+5) + "' y='" + String(y0+8) + "' fill='#555' font-size='11'>" + String(humMax,1) + "</text>";
+    s += "<text x='" + String(x0+plotW+5) + "' y='" + String(y0+plotH) + "' fill='#555' font-size='11'>" + String(humMin,1) + "</text>";
+  }
+  s += "</g>";
+  // Pressure panel
+  y0 = pad + 2*(plotH + 30);
+  s += "<g>";
+  s += "<text x='" + String(x0) + "' y='" + String(y0 - 10) + "' fill='#333' font-size='12'>Pressure (hPa)</text>";
+  s += "<rect x='" + String(x0) + "' y='" + String(y0) + "' width='" + String(plotW) + "' height='" + String(plotH) + "' fill='#fff' stroke='#ddd'/>";
+  for (int g=0; g<=4; g++) {
+    float gy = y0 + plotH * g / 4.0f;
+    s += "<line x1='" + String(x0) + "' y1='" + String(gy) + "' x2='" + String(x0+plotW) + "' y2='" + String(gy) + "' stroke='#eee'/>";
+  }
+  addPolyline(s, a_pres, n, pMin, pMax, x0, y0, plotW, plotH, "#6d597a", false);
+  if (finite(pMin) && finite(pMax)) {
+    s += "<text x='" + String(x0+plotW+5) + "' y='" + String(y0+8) + "' fill='#555' font-size='11'>" + String(pMax,1) + "</text>";
+    s += "<text x='" + String(x0+plotW+5) + "' y='" + String(y0+plotH) + "' fill='#555' font-size='11'>" + String(pMin,1) + "</text>";
+  }
+  s += "</g>";
+  s += "</svg></div>";
+
+  // Table
+  s += "<div class='box'>";
+  s += "<div class='legend'><span class='k'>Table:</span> oldest → newest</div>";
+  s += "<table><thead><tr><th>#</th><th>t+sec</th><th>BMP Temp (°C)</th><th>DHT Temp (°C)</th><th>Humidity (%)</th><th>Pressure (hPa)</th></tr></thead><tbody>";
+  uint32_t t0 = (n>0) ? tmp[0].t_ms : 0;
+  for (int i = 0; i < n; i++) {
+    s += "<tr><td>";
+    s += String(i+1);
+    s += "</td><td>";
+    s += String((tmp[i].t_ms - t0)/1000.0f, 1);
+    s += "</td><td>";
+    s += finite(tmp[i].bmp_temp_c) ? String(tmp[i].bmp_temp_c, 2) : String("--");
+    s += "</td><td>";
+    s += finite(tmp[i].dht_temp_c) ? String(tmp[i].dht_temp_c, 1) : String("--");
+    s += "</td><td>";
+    s += finite(tmp[i].dht_hum_pct) ? String(tmp[i].dht_hum_pct, 1) : String("--");
+    s += "</td><td>";
+    s += finite(tmp[i].pressure_hpa) ? String(tmp[i].pressure_hpa, 2) : String("--");
+    s += "</td></tr>";
+  }
+  s += "</tbody></table>";
+  s += "<div class='note'>Export generated on device; graphs are inline SVG (works offline). Save this page for your records.</div>";
+  s += "</div>";
+
+  s += "</body></html>";
+  server.send(200, "text/html; charset=utf-8", s);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  // I2C + sensors
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // Wi-Fi STA
+  connectWiFiOnce();
+
+  // BMP280 init (try both addresses)
+  bool bmpOK = bmp.begin(BMP_ADDR_1) || bmp.begin(BMP_ADDR_2);
+  if (bmpOK) {
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                    Adafruit_BMP280::SAMPLING_X2,
+                    Adafruit_BMP280::SAMPLING_X16,
+                    Adafruit_BMP280::FILTER_X16,
+                    Adafruit_BMP280::STANDBY_MS_500);
+    Serial.println("BMP280 initialized.");
+  } else {
+    Serial.println("BMP280 not found at 0x76/0x77. Continuing without BMP.");
+  }
+
+  // DHT11
+  dht.begin();
+  Serial.println("DHT11 initialized.");
+
+  // Web server
+  server.on("/", handleRoot);
+  server.on("/export46.html", handleExport46Html);
+  server.begin();
+  Serial.println("HTTP server started.");
+
+  nextSampleAt = millis(); // start immediately
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+  // Reconnect Wi-Fi if needed
+  static unsigned long nextWifiAttemptAt = 0;
+  if (WiFi.status() != WL_CONNECTED && now >= nextWifiAttemptAt) {
+    bool ok = connectWiFiOnce(8000);
+    nextWifiAttemptAt = now + (ok ? 0 : 3000);
+  }
+
+  if (now < nextSampleAt) return;
+  nextSampleAt += sampleIntervalMs;
+
+  // Read sensors
+  float bmpTempC = NAN, pressureHpa = NAN;
+  // crude presence check: bmp.readTemperature returns NAN if not initialized
+  bmpTempC = bmp.readTemperature();
+  pressureHpa = bmp.readPressure() / 100.0f;
+
+  float dhtHum = dht.readHumidity();
+  float dhtTempC = dht.readTemperature();
+
+  // Buffer
+  Sample s;
+  s.t_ms = now;
+  s.bmp_temp_c = bmpTempC;
+  s.pressure_hpa = pressureHpa;
+  s.dht_hum_pct = dhtHum;
+  s.dht_temp_c = dhtTempC;
+  bufferSample(s);
+
+  // JSON
+  String json = "{";
+  json += "\"seq\":" + String(seq) + ",";
+  json += "\"timestamp_ms\":" + String(now) + ",";
+  if (finite(bmpTempC))    json += "\"temperature_c\":" + String(bmpTempC, 2) + ",";
+  if (finite(pressureHpa)) json += "\"pressure_hpa\":" + String(pressureHpa, 2) + ",";
+  if (finite(dhtHum))      json += "\"humidity_pct\":" + String(dhtHum, 1) + ",";
+  if (finite(dhtTempC))    json += "\"dht_temp_c\":" + String(dhtTempC, 1) + ",";
+  json += "\"src\":\"sensor\"}";
+
+  Serial.println("POST: " + json);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient client;
+    HTTPClient http;
+    http.setTimeout(4000);
+    http.setReuse(false);
+    if (http.begin(client, POST_URL)) {
+      http.addHeader("Content-Type", "application/json");
+      int code = http.POST(json);
+      Serial.println("HTTP " + String(code));
+      if (code == 200) seq++;
+      http.end();
+    } else {
+      Serial.println("HTTP begin failed");
+    }
+  } else {
+    Serial.println("Skip POST: Wi‑Fi not connected");
+  }
+}
