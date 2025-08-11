@@ -1,0 +1,359 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+#define AP_SSID "ESP32-Test-AP"
+#define AP_PASS "" // open AP; set a password if you prefer
+
+WebServer server(80);
+
+// Time window to retain (3 minutes)
+const unsigned long WINDOW_MS = 30000;
+
+// Max samples we’re willing to hold (supports up to 2 Hz safely: 360)
+const size_t MAX_BUFFER = 360;
+
+struct SensorData {
+  int seq;
+  unsigned long sensor_ms; // from sensor
+  unsigned long ap_ms;     // arrival time on AP
+  float temperature_c;
+  float pressure_hpa;
+};
+
+// Ring buffer
+SensorData buf[MAX_BUFFER];
+size_t count = 0;
+size_t startIdx = 0; // index of oldest
+size_t endIdx   = 0; // one past newest
+
+// Export control
+bool freezeForExport = false;  // when true, no new data is stored
+unsigned long exportGen = 0;   // generation id
+unsigned long windowStartApMs = 0; // ap_ms of oldest in current window
+
+// Snapshot info for export while we are frozen
+size_t snapCount = 0;
+size_t snapStartIdx = 0;
+unsigned long snapGen = 0;
+
+String jsonEscape(const String &s) {
+  String out;
+  out.reserve(s.length() + 4);
+  for (char c : s) {
+    if (c == '"' || c == '\\') out += '\\';
+    out += c;
+  }
+  return out;
+}
+
+size_t indexOf(size_t base, size_t offset) {
+  return (base + offset) % MAX_BUFFER;
+}
+
+void clearBuffer() {
+  count = 0;
+  startIdx = 0;
+  endIdx = 0;
+  windowStartApMs = 0;
+}
+
+void takeSnapshotForExport() {
+  snapCount = count;
+  snapStartIdx = startIdx;
+  snapGen = exportGen;
+}
+
+void pushData(const SensorData &d) {
+  // If buffer empty, set window start
+  if (count == 0) {
+    windowStartApMs = d.ap_ms;
+  }
+
+  // If frozen, do not accept new data
+  if (freezeForExport) return;
+
+  // Append
+  buf[endIdx] = d;
+  endIdx = (endIdx + 1) % MAX_BUFFER;
+  if (count < MAX_BUFFER) {
+    count++;
+  } else {
+    // Would overwrite the oldest — but we prefer to avoid this by freezing earlier
+    startIdx = (startIdx + 1) % MAX_BUFFER;
+  }
+
+  // Check window length by AP wall-clock
+  unsigned long oldestApMs = (count > 0) ? buf[startIdx].ap_ms : d.ap_ms;
+  unsigned long windowSpan = d.ap_ms - oldestApMs;
+
+  if (windowSpan >= WINDOW_MS) {
+    // Lock buffer for export; prevent overwrite
+    freezeForExport = true;
+    exportGen++;
+    takeSnapshotForExport();
+    // From now on, ingestion will reject with 409 until downloaded.
+  }
+}
+
+void handleIngest() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+
+  // If frozen, reject with 409
+  if (freezeForExport) {
+    server.send(409, "text/plain", "Export pending; download CSV before new data");
+    return;
+  }
+
+  // Read body
+  String body = server.arg("plain");
+  // Minimal JSON parse (naive; assumes fields exist)
+  // Safer would be ArduinoJson, but we keep dependencies minimal.
+  SensorData d;
+  d.seq = 0;
+  d.sensor_ms = 0;
+  d.temperature_c = NAN;
+  d.pressure_hpa = NAN;
+
+  auto findNumber = [&](const char* key, float &outF, long &outL, bool wantFloat) -> bool {
+    int k = body.indexOf(key);
+    if (k < 0) return false;
+    int colon = body.indexOf(':', k);
+    if (colon < 0) return false;
+    int end = body.indexOf(',', colon + 1);
+    if (end < 0) end = body.indexOf('}', colon + 1);
+    if (end < 0) return false;
+    String num = body.substring(colon + 1, end);
+    num.trim();
+    if (wantFloat) {
+      outF = num.toFloat();
+    } else {
+      outL = num.toInt();
+    }
+    return true;
+  };
+
+  float ftmp;
+  long ltmp;
+
+  if (findNumber("\"seq\"", ftmp, ltmp, false)) d.seq = (int)ltmp;
+  if (findNumber("\"timestamp_ms\"", ftmp, ltmp, false)) d.sensor_ms = (unsigned long)ltmp;
+  if (findNumber("\"temperature_c\"", ftmp, ltmp, true)) d.temperature_c = ftmp;
+  if (findNumber("\"pressure_hpa\"", ftmp, ltmp, true)) d.pressure_hpa = ftmp;
+
+  d.ap_ms = millis();
+
+  pushData(d);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void sendLatestJson() {
+  if (count == 0) {
+    server.send(200, "application/json", "{}");
+    return;
+  }
+  size_t latestIdx = (endIdx + MAX_BUFFER - 1) % MAX_BUFFER;
+  SensorData &x = buf[latestIdx];
+  String s = "{";
+  s += "\"seq\":" + String(x.seq) + ",";
+  s += "\"timestamp_ms\":" + String(x.sensor_ms) + ",";
+  s += "\"ap_ms\":" + String(x.ap_ms) + ",";
+  s += "\"temperature_c\":" + String(x.temperature_c, 2) + ",";
+  s += "\"pressure_hpa\":" + String(x.pressure_hpa, 2) + ",";
+  s += "\"buffer_count\":" + String(count) + ",";
+  s += "\"freeze\":" + String(freezeForExport ? "true" : "false") + ",";
+  s += "\"gen\":" + String(exportGen);
+  s += "}";
+  server.send(200, "application/json", s);
+}
+
+void sendHistoryJson() {
+  String s = "[";
+  for (size_t i = 0; i < count; i++) {
+    size_t idx = indexOf(startIdx, i);
+    SensorData &x = buf[idx];
+    s += "{\"seq\":" + String(x.seq) +
+         ",\"timestamp_ms\":" + String(x.sensor_ms) +
+         ",\"ap_ms\":" + String(x.ap_ms) +
+         ",\"temperature_c\":" + String(x.temperature_c, 2) +
+         ",\"pressure_hpa\":" + String(x.pressure_hpa, 2) + "}";
+    if (i + 1 < count) s += ",";
+  }
+  s += "]";
+  server.send(200, "application/json", s);
+}
+
+void sendStatusJson() {
+  unsigned long span = 0;
+  if (count > 0) {
+    unsigned long oldest = buf[startIdx].ap_ms;
+    unsigned long newest = buf[(endIdx + MAX_BUFFER - 1) % MAX_BUFFER].ap_ms;
+    span = newest - oldest;
+  }
+  String s = "{";
+  s += "\"count\":" + String(count) + ",";
+  s += "\"span_ms\":" + String(span) + ",";
+  s += "\"freeze\":" + String(freezeForExport ? "true" : "false") + ",";
+  s += "\"gen\":" + String(exportGen) + ",";
+  s += "\"window_ms\":" + String(WINDOW_MS) + ",";
+  s += "\"max_buffer\":" + String(MAX_BUFFER) + ",";
+  s += "\"snapshot_count\":" + String(snapCount) + ",";
+  s += "\"snapshot_gen\":" + String(snapGen);
+  s += "}";
+  server.send(200, "application/json", s);
+}
+
+void sendCsvSnapshot() {
+  if (!freezeForExport || snapCount == 0) {
+    server.send(400, "text/plain", "No export pending");
+    return;
+  }
+
+  // Build CSV
+  String csv;
+  csv.reserve(64 * snapCount + 64);
+  csv += "gen,seq,sensor_ms,ap_ms,temperature_c,pressure_hpa\n";
+  for (size_t i = 0; i < snapCount; i++) {
+    size_t idx = indexOf(snapStartIdx, i);
+    SensorData &x = buf[idx];
+    csv += String(snapGen) + "," + String(x.seq) + "," + String(x.sensor_ms) + "," +
+           String(x.ap_ms) + "," + String(x.temperature_c, 2) + "," +
+           String(x.pressure_hpa, 2) + "\n";
+  }
+
+  // Send with download headers
+  String filename = "readings_" + String(snapGen) + ".csv";
+  server.sendHeader("Content-Type", "text/csv");
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+  server.send(200, "text/csv", csv);
+
+  // After responding, release freeze and start a fresh window
+  freezeForExport = false;
+  clearBuffer();        // start a new 3-minute window cleanly
+  snapCount = 0;
+}
+
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ESP32 Sensor Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    .card { border: 1px solid #ccc; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .stat { min-width: 160px; }
+    .freeze { color: #b00020; font-weight: 700; }
+    button { padding: 8px 12px; }
+  </style>
+</head>
+<body>
+  <h2>ESP32 Live Dashboard</h2>
+  <div class="row">
+    <div class="card stat">
+      <div>Temperature (°C)</div>
+      <div id="t">--</div>
+    </div>
+    <div class="card stat">
+      <div>Pressure (hPa)</div>
+      <div id="p">--</div>
+    </div>
+    <div class="card stat">
+      <div>Buffer Count</div>
+      <div id="c">0</div>
+    </div>
+    <div class="card stat">
+      <div>Span (s)</div>
+      <div id="s">0</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div>Status: <span id="status">Collecting…</span></div>
+    <button id="download" disabled>Download CSV</button>
+  </div>
+
+  <script>
+    let lastGen = -1;
+    async function poll() {
+      try {
+        const r1 = await fetch('/data');
+        const d1 = await r1.json();
+        if (d1.temperature_c !== undefined) document.getElementById('t').textContent = d1.temperature_c.toFixed(2);
+        if (d1.pressure_hpa !== undefined) document.getElementById('p').textContent = d1.pressure_hpa.toFixed(2);
+        if (d1.buffer_count !== undefined) document.getElementById('c').textContent = d1.buffer_count;
+
+        const r2 = await fetch('/status');
+        const st = await r2.json();
+        const spanSec = Math.floor((st.span_ms || 0) / 1000);
+        document.getElementById('s').textContent = spanSec;
+
+        const btn = document.getElementById('download');
+        const status = document.getElementById('status');
+
+        if (st.freeze) {
+          status.textContent = 'Ready to export 3-minute CSV (gen ' + st.gen + ')';
+          status.className = 'freeze';
+          btn.disabled = false;
+
+          // Auto-download once per generation
+          if (st.gen !== lastGen) {
+            lastGen = st.gen;
+            // Trigger download
+            const a = document.createElement('a');
+            a.href = '/download.csv';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+          }
+        } else {
+          status.textContent = 'Collecting…';
+          status.className = '';
+          btn.disabled = true;
+        }
+      } catch (e) {
+        console.log(e);
+      } finally {
+        setTimeout(poll, 1000);
+      }
+    }
+    document.getElementById('download').addEventListener('click', () => {
+      window.location.href = '/download.csv';
+    });
+    poll();
+  </script>
+</body>
+</html>
+)HTML";
+
+void handleIndex() {
+  server.send(200, "text/html", INDEX_HTML);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  WiFi.mode(WIFI_AP);
+  bool apok = WiFi.softAP(AP_SSID, AP_PASS);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("AP up: "); Serial.print(AP_SSID); Serial.print(" @ "); Serial.println(ip);
+
+  server.on("/", HTTP_GET, handleIndex);
+  server.on("/ingest", HTTP_POST, handleIngest);
+  server.on("/data", HTTP_GET, sendLatestJson);
+  server.on("/history", HTTP_GET, sendHistoryJson);
+  server.on("/status", HTTP_GET, sendStatusJson);
+  server.on("/download.csv", HTTP_GET, sendCsvSnapshot);
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  server.handleClient();
+}
