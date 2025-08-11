@@ -1,0 +1,169 @@
+/*
+Use USBC esp32 
+ESP32 SoftAP + Captive Portal + about.txt
+  - Prints AP IP periodically to Serial
+  - Serves /about.txt with live info
+  - Redirects all DNS/HTTP to the ESP32 (captive portal)
+  Tested with Arduino ESP32 core 2.x
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+
+// ====================== User configuration ======================
+const char* AP_SSID       = "ESP32-Test-AP";
+const char* AP_PASS       = "esp32test";      // >=8 chars for WPA2, else open network
+const uint8_t AP_CHANNEL  = 6;
+const bool AP_HIDDEN      = false;
+const uint8_t AP_MAX_CONN = 4;
+
+IPAddress AP_IP(192, 168, 4, 1);
+IPAddress AP_GW(192, 168, 4, 1);
+IPAddress AP_MASK(255, 255, 255, 0);
+
+// Captive portal domain catch-all
+const byte DNS_PORT = 53;
+
+// ====================== Globals ======================
+WebServer server(80);
+DNSServer dnsServer;
+
+volatile uint32_t g_staCount = 0;
+
+// ====================== Utilities ======================
+String formatUptime() {
+  uint32_t ms = millis();
+  uint32_t sec = ms / 1000;
+  uint32_t s = sec % 60;
+  uint32_t m = (sec / 60) % 60;
+  uint32_t h = (sec / 3600);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%02u:%02u:%02u", h, m, s);
+  return String(buf);
+}
+
+String aboutText() {
+  String txt;
+  txt += "ESP32 SoftAP Status\n";
+  txt += "-------------------\n";
+  txt += "SSID: " + String(AP_SSID) + "\n";
+  txt += "IP: " + WiFi.softAPIP().toString() + "\n";
+  txt += "Gateway: " + AP_GW.toString() + "\n";
+  txt += "Subnet: " + AP_MASK.toString() + "\n";
+  txt += "MAC: " + WiFi.softAPmacAddress() + "\n";
+  txt += "Channel: " + String(AP_CHANNEL) + "\n";
+  txt += "Auth: " + String((strlen(AP_PASS) >= 8) ? "WPA2-PSK" : "Open") + "\n";
+  txt += "Max connections: " + String(AP_MAX_CONN) + "\n";
+  txt += "Connected stations: " + String(WiFi.softAPgetStationNum()) + "\n";
+  txt += "Uptime (hh:mm:ss): " + formatUptime() + "\n";
+  txt += "\nAccess this file at http://" + WiFi.softAPIP().toString() + "/about.txt\n";
+  return txt;
+}
+
+void sendAboutTxt() {
+  server.send(200, "text/plain", aboutText());
+}
+
+void sendLanding() {
+  String html = F(
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta http-equiv='refresh' content='0; url=/about.txt'>"
+    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+    "<title>ESP32 SoftAP</title></head><body>"
+    "<p>Redirecting to <a href='/about.txt'>about.txt</a>...</p>"
+    "</body></html>"
+  );
+  server.send(200, "text/html", html);
+}
+
+// Captive-portal helpers
+bool isCaptivePortal() {
+  String host = server.hostHeader();
+  if (!host.length()) return true;
+  // If client tries to reach anything except our IP/hostname, treat as captive
+  return !(host == WiFi.softAPIP().toString() || host == "esp32" || host.endsWith(".local"));
+}
+
+// ====================== Event handlers ======================
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+      g_staCount++;
+      Serial.printf("[WiFi] Station connected. Total: %u\n", g_staCount);
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+      g_staCount = (g_staCount > 0) ? g_staCount - 1 : 0;
+      Serial.printf("[WiFi] Station disconnected. Total: %u\n", g_staCount);
+      break;
+    default:
+      break;
+  }
+}
+
+// ====================== Setup/Loop ======================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println();
+  Serial.println("ESP32 SoftAP + Captive Portal + about.txt");
+
+  WiFi.onEvent(onWiFiEvent);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
+
+  const char* password = (strlen(AP_PASS) >= 8) ? AP_PASS : nullptr;
+  bool ok = WiFi.softAP(AP_SSID, password, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("SoftAP %s | SSID: %s | IP: %s\n",
+                ok ? "started" : "FAILED",
+                AP_SSID, ip.toString().c_str());
+
+  // DNS: resolve everything to our AP IP (captive portal)
+  dnsServer.start(DNS_PORT, "*", AP_IP);
+
+  // HTTP routes
+  // OS connectivity checks
+  server.on("/generate_204", HTTP_ANY, []() { sendLanding(); });               // Android
+  server.on("/gen_204", HTTP_ANY, []() { sendLanding(); });                    // Alt Android
+  server.on("/hotspot-detect.html", HTTP_ANY, []() { sendLanding(); });        // Apple
+  server.on("/ncsi.txt", HTTP_ANY, []() { sendLanding(); });                   // Windows
+  server.on("/connecttest.txt", HTTP_ANY, []() { sendLanding(); });            // Windows
+  server.on("/library/test/success.html", HTTP_ANY, []() { sendLanding(); });  // Apple alt
+
+  // Main endpoints
+  server.on("/", HTTP_ANY, []() {
+    if (isCaptivePortal()) { sendLanding(); return; }
+    sendLanding(); // still redirect to about.txt for simplicity
+  });
+
+  server.on("/about.txt", HTTP_GET, []() {
+    sendAboutTxt();
+  });
+
+  // Catch-all: redirect to about.txt (keeps the experience consistent)
+  server.onNotFound([]() {
+    if (isCaptivePortal()) { sendLanding(); return; }
+    server.sendHeader("Location", "/about.txt", true);
+    server.send(302, "text/plain", "Redirecting to /about.txt");
+  });
+
+  server.begin();
+  Serial.println("Web server started.");
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+
+  static uint32_t last = 0;
+  if (millis() - last > 5000) {
+    last = millis();
+    Serial.printf("AP IP: %s | Stations: %u | Uptime: %s\n",
+                  WiFi.softAPIP().toString().c_str(),
+                  WiFi.softAPgetStationNum(),
+                  formatUptime().c_str());
+  }
+}
+
