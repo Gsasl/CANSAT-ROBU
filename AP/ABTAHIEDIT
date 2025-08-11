@@ -1,0 +1,361 @@
+#include <Wire.h>
+#include <MPU6500_WE.h>
+#include <Adafruit_BMP280.h>
+#include <QMC5883LCompass.h>
+#include <HardwareSerial.h>
+#include <math.h>
+
+// -------- MPU6500 Setup --------
+#define MPU6500_ADDR 0x68
+TwoWire MPU_Wire = TwoWire(1);  // I2C for MPU on pins 18,19
+MPU6500_WE myMPU(&MPU_Wire);
+
+// Filter parameters
+const float alpha = 0.2;
+float filteredAccX = 0, filteredAccY = 0, filteredAccZ = 0;
+float filteredGyrX = 0, filteredGyrY = 0, filteredGyrZ = 0;
+
+// Calibration offsets
+float accelOffsetX = 0, accelOffsetY = 0, accelOffsetZ = 0;
+float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
+
+// -------- BMP280 Setup --------
+Adafruit_BMP280 bmp;  // Uses default Wire (pins 21,22)
+float baselinePressure = 1013.25;
+bool bmpAvailable = false;
+
+// -------- QMC5883L Compass Setup --------
+QMC5883LCompass compass;  // Uses default Wire (pins 21,22)
+
+// Calibration offsets for compass
+float offsetX = 0, offsetY = 0, offsetZ = 0;
+
+// Calibration variables for compass
+bool calibrating = true;
+unsigned long calibrationStartTime;
+const unsigned long calibrationDuration = 30000; // 30 seconds
+
+int minX = 32767, maxX = -32768;
+int minY = 32767, maxY = -32768;
+int minZ = 32767, maxZ = -32768;
+
+// Smoothing parameters for compass
+float smoothedHeading = 0;
+const float compassAlpha = 0.09;  // smoothing factor
+
+// Dead zone threshold for compass
+const float deadZone = 10.0;
+
+// -------- GPS Setup --------
+HardwareSerial GPS_Serial(2);  // Use UART2
+#define RXD2 16
+#define TXD2 17
+
+String gpsBuffer = "";
+float gpsLatitude = 0.0;
+float gpsLongitude = 0.0;
+bool gpsFixAvailable = false;
+
+// -------- Helper function for compass directions --------
+String getDirection(float heading) {
+  const float threshold = 15.0; // degrees tolerance for combined directions
+
+  if ((heading >= 0 && heading < 22.5) || (heading >= 337.5 && heading <= 360))
+    return "North";
+  else if (heading >= 22.5 && heading < 67.5)
+    return "North-East";
+  else if (heading >= 67.5 && heading < 112.5)
+    return "East";
+  else if (heading >= 112.5 && heading < 157.5)
+    return "South-East";
+  else if (heading >= 157.5 && heading < 202.5)
+    return "South";
+  else if (heading >= 202.5 && heading < 247.5)
+    return "South-West";
+  else if (heading >= 247.5 && heading < 292.5)
+    return "West";
+  else if (heading >= 292.5 && heading < 337.5)
+    return "North-West";
+
+  if ((abs(heading - 0) < threshold) || (abs(heading - 180) < threshold))
+    return "North-South";
+
+  if ((abs(heading - 90) < threshold) || (abs(heading - 270) < threshold))
+    return "East-West";
+
+  return "Unknown";
+}
+
+// -------- GPS Parsing Functions --------
+void parseGPS(String nmea) {
+  int fieldIndex = 0;
+  String fields[20];
+  int start = 0;
+
+  for (int i = 0; i < nmea.length(); i++) {
+    if (nmea[i] == ',' || nmea[i] == '*') {
+      fields[fieldIndex++] = nmea.substring(start, i);
+      start = i + 1;
+    }
+  }
+
+  if (nmea.startsWith("$GPGGA")) {
+    if (fields[2] != "" && fields[4] != "") {
+      gpsLatitude = convertToDecimal(fields[2], fields[3]);
+      gpsLongitude = convertToDecimal(fields[4], fields[5]);
+      gpsFixAvailable = true;
+    } else {
+      gpsFixAvailable = false;
+    }
+  } else if (nmea.startsWith("$GPRMC")) {
+    if (fields[2] == "A" && fields[3] != "" && fields[5] != "") {
+      gpsLatitude = convertToDecimal(fields[3], fields[4]);
+      gpsLongitude = convertToDecimal(fields[5], fields[6]);
+      gpsFixAvailable = true;
+    } else {
+      gpsFixAvailable = false;
+    }
+  }
+}
+
+float convertToDecimal(String rawCoord, String direction) {
+  float degMin = rawCoord.toFloat();
+  int degrees = int(degMin / 100);
+  float minutes = degMin - (degrees * 100);
+  float decimal = degrees + (minutes / 60.0);
+
+  if (direction == "S" || direction == "W") {
+    decimal *= -1;
+  }
+  return decimal;
+}
+
+// -------- MPU Calibration Function --------
+void calibrateMPU() {
+  Serial.println("Calibrating MPU6500... Keep sensor flat and still!");
+  delay(3000);
+
+  const int samples = 100;
+  float sumAccX = 0, sumAccY = 0, sumAccZ = 0;
+  float sumGyrX = 0, sumGyrY = 0, sumGyrZ = 0;
+
+  for (int i = 0; i < samples; i++) {
+    xyzFloat accRaw = myMPU.getAccRawValues();
+    xyzFloat gyrRaw = myMPU.getGyrRawValues();
+
+    sumAccX += accRaw.x;
+    sumAccY += accRaw.y;
+    sumAccZ += accRaw.z;
+
+    sumGyrX += gyrRaw.x;
+    sumGyrY += gyrRaw.y;
+    sumGyrZ += gyrRaw.z;
+
+    delay(10);
+  }
+
+  accelOffsetX = sumAccX / samples;
+  accelOffsetY = sumAccY / samples;
+  accelOffsetZ = (sumAccZ / samples) - 4096;  // expect 1g on Z-axis
+
+  gyroOffsetX = sumGyrX / samples;
+  gyroOffsetY = sumGyrY / samples;
+  gyroOffsetZ = sumGyrZ / samples;
+
+  Serial.println("MPU6500 Calibration complete!");
+}
+
+// -------- Setup --------
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize GPS Serial
+  GPS_Serial.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  Serial.println("Reading structured GPS data...\n");
+
+  // Initialize default Wire (I2C) on pins 21 (SDA), 22 (SCL)
+  Wire.begin(21, 22);
+
+  // Initialize compass (uses default Wire)
+  compass.init();
+
+  // Initialize BMP280 sensor (default Wire)
+  if (bmp.begin(0x76)) {
+    bmpAvailable = true;
+    Serial.println("BMP280 sensor detected.");
+    Serial.println("Calibrating BMP280 baseline pressure... Please keep sensor still.");
+    delay(2000);
+
+    const int samples = 200;
+    float pressureSum = 0;
+    for (int i = 0; i < samples; i++) {
+      pressureSum += bmp.readPressure() / 100.0;
+      delay(30);
+    }
+    baselinePressure = pressureSum / samples;
+    Serial.print("BMP280 Baseline pressure calibrated: ");
+    Serial.print(baselinePressure);
+    Serial.println(" hPa");
+  } else {
+    Serial.println("BMP280 not found. Continuing without BMP280...");
+  }
+
+  // Initialize MPU6500 I2C bus on pins 18, 19
+  MPU_Wire.begin(18, 19, 400000);
+  if (!myMPU.init()) {
+    Serial.println("MPU6500 init failed");
+  }
+  Serial.println("MPU6500 Connected!");
+
+  myMPU.setAccRange(MPU6500_ACC_RANGE_8G);
+  myMPU.setGyrRange(MPU6500_GYRO_RANGE_500);
+  myMPU.setSampleRateDivider(5);
+  myMPU.setAccDLPF(MPU6500_DLPF_4);
+  myMPU.enableAccDLPF(true);
+
+  calibrateMPU();
+
+  calibrationStartTime = millis();
+  Serial.println("Rotate sensor slowly in all directions for 30 seconds to calibrate compass offsets.");
+}
+
+// -------- Loop --------
+void loop() {
+  // Read GPS data if available
+  while (GPS_Serial.available()) {
+    char c = GPS_Serial.read();
+    if (c == '\n') {
+      gpsBuffer.trim();
+      if (gpsBuffer.startsWith("$GPGGA") || gpsBuffer.startsWith("$GPRMC")) {
+        parseGPS(gpsBuffer);
+      }
+      gpsBuffer = "";
+    } else {
+      gpsBuffer += c;
+    }
+  }
+
+  // -------------- MPU Data --------------
+  xyzFloat accRaw = myMPU.getAccRawValues();
+  xyzFloat gyrRaw = myMPU.getGyrRawValues();
+
+  float accX = accRaw.x - accelOffsetX;
+  float accY = accRaw.y - accelOffsetY;
+  float accZ = accRaw.z - accelOffsetZ;
+
+  float gyrX = gyrRaw.x - gyroOffsetX;
+  float gyrY = gyrRaw.y - gyroOffsetY;
+  float gyrZ = gyrRaw.z - gyroOffsetZ;
+
+  float accX_g = accX / 4096.0;
+  float accY_g = accY / 4096.0;
+  float accZ_g = accZ / 4096.0;
+
+  float gyrX_dps = gyrX / 65.5;
+  float gyrY_dps = gyrY / 65.5;
+  float gyrZ_dps = gyrZ / 65.5;
+
+  float accX_ms2 = accX_g * 9.80665;
+  float accY_ms2 = accY_g * 9.80665;
+  float accZ_ms2 = accZ_g * 9.80665;
+
+  filteredAccX = (1 - alpha) * filteredAccX + alpha * accX_ms2;
+  filteredAccY = (1 - alpha) * filteredAccY + alpha * accY_ms2;
+  filteredAccZ = (1 - alpha) * filteredAccZ + alpha * accZ_ms2;
+
+  filteredGyrX = (1 - alpha) * filteredGyrX + alpha * gyrX_dps;
+  filteredGyrY = (1 - alpha) * filteredGyrY + alpha * gyrY_dps;
+  filteredGyrZ = (1 - alpha) * filteredGyrZ + alpha * gyrZ_dps;
+
+  // -------------- BMP280 Data --------------
+  float temperature = 0;
+  float currentPressure = 0;
+  float altitude = 0;
+  if (bmpAvailable) {
+    currentPressure = bmp.readPressure() / 100.0;
+    temperature = bmp.readTemperature();
+    altitude = 44330.0 * (1.0 - pow(currentPressure / baselinePressure, 0.1903));
+  }
+
+  // -------------- Compass Data --------------
+  compass.read();
+
+  int rawX = compass.getX();
+  int rawY = compass.getY();
+  int rawZ = compass.getZ();
+
+  if (calibrating) {
+    if (rawX < minX) minX = rawX;
+    if (rawX > maxX) maxX = rawX;
+    if (rawY < minY) minY = rawY;
+    if (rawY > maxY) maxY = rawY;
+    if (rawZ < minZ) minZ = rawZ;
+    if (rawZ > maxZ) maxZ = rawZ;
+
+    unsigned long elapsed = millis() - calibrationStartTime;
+    Serial.print("Calibrating compass... ");
+    Serial.print(elapsed / 1000);
+    Serial.println("s");
+
+    if (elapsed >= calibrationDuration) {
+      calibrating = false;
+      offsetX = (maxX + minX) / 2.0;
+      offsetY = (maxY + minY) / 2.0;
+      offsetZ = (maxZ + minZ) / 2.0;
+
+      Serial.println("\nCompass calibration complete.");
+      Serial.print("Offsets - X: "); Serial.print(offsetX);
+      Serial.print(" Y: "); Serial.print(offsetY);
+      Serial.print(" Z: "); Serial.println(offsetZ);
+      Serial.println("Starting calibrated heading output...\n");
+    }
+    delay(500);
+    return;  // skip rest until calibration done
+  }
+
+  float calX = rawX - offsetX;
+  float calY = rawY - offsetY;
+
+  if (!(abs(calX) < deadZone && abs(calY) < deadZone)) {
+    float heading = atan2(calY, calX) * 180.0 / PI;
+    if (heading < 0) heading += 360;
+    smoothedHeading = compassAlpha * heading + (1 - compassAlpha) * smoothedHeading;
+  }
+
+  float displayHeading = round(smoothedHeading * 10) / 10.0;
+  String direction = getDirection(displayHeading);
+
+  // -------- Print all sensor data --------
+  Serial.println();
+  Serial.println("========== SENSOR READINGS ==========");
+
+  Serial.print("Gyroscope (°/s) -> ");
+  Serial.print("Yaw (Z): "); Serial.print(filteredGyrZ, 1); Serial.print("°/s | ");
+  Serial.print("Pitch (X): "); Serial.print(filteredGyrX, 1); Serial.print("°/s | ");
+  Serial.print("Roll (Y): "); Serial.print(filteredGyrY, 1); Serial.println("°/s");
+
+  Serial.print("Accelerometer (m/s²) -> ");
+  Serial.print("Towards x-axis: "); Serial.print(filteredAccX, 2); Serial.print(" m/s² | ");
+  Serial.print("Towards y-axis: "); Serial.print(filteredAccY, 2); Serial.print(" m/s² | ");
+  Serial.print("Towards z-axis: "); Serial.print(filteredAccZ, 2); Serial.println(" m/s²");
+
+  Serial.print("Temperature: "); Serial.print(temperature); Serial.print(" °C | ");
+  Serial.print("Pressure: "); Serial.print(currentPressure); Serial.print(" hPa | ");
+  Serial.print("Altitude: "); Serial.print(altitude); Serial.println(" m");
+
+  Serial.print("Compass Heading: "); Serial.print(displayHeading); Serial.print("° ");
+  Serial.println(direction);
+
+  if (gpsFixAvailable) {
+    Serial.print("GPS Latitude:  ");
+    Serial.print(gpsLatitude, 6);
+    Serial.print(" | Longitude: ");
+    Serial.println(gpsLongitude, 6);
+  } else {
+    Serial.println("GPS fix not available");
+  }
+
+  Serial.println("=====================================");
+  Serial.println();
+
+  delay(3500);}
