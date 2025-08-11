@@ -1,0 +1,437 @@
+/*
+  ESP32 USB-C AP: SoftAP + ingest + dashboard + CSV/export
+  - Creates Wi-Fi SoftAP (default IP 192.168.4.1).
+  - Accepts POST /ingest with JSON:
+      { seq, timestamp_ms, temperature_c, pressure_hpa, humidity_pct, dht_temp_c, src }
+  - Buffers last 180 samples (~3 minutes @1 Hz).
+  - Serves:
+      /            live dashboard (cards + mini table)
+      /latest.json JSON of latest sample
+      /series.json JSON arrays of last N samples
+      /csv         CSV export of buffer
+      /export.html Static HTML export with inline SVG graphs and a table
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// -------- SoftAP settings --------
+const char* AP_SSID = "ESP32-Test-AP";
+const char* AP_PASS = "";        // optional: set a password (>=8 chars) or leave "" for open
+const int   AP_CHANNEL = 6;
+const bool  AP_HIDDEN  = false;
+const int   AP_MAX_CONN = 4;
+
+// -------- Web server --------
+WebServer server(80);
+
+// -------- Data model --------
+struct Sample {
+  uint32_t ap_ms;         // receive time (ms on AP)
+  long     seq;           // from sender
+  uint32_t sensor_ms;     // sender timestamp_ms
+  float temperature_c;    // BMP280 temp
+  float pressure_hpa;     // BMP280 pressure
+  float humidity_pct;     // DHT11 humidity
+  float dht_temp_c;       // DHT11 temp
+};
+
+static const int BUFSZ = 180; // ~3 minutes @1 Hz
+Sample ring[BUFSZ];
+int ringCount = 0;
+int ringHead  = 0;
+
+static inline bool isValidF(float x) { return !isnan(x) && isfinite(x); }
+
+
+void bufferSample(const Sample& s) {
+  ring[ringHead] = s;
+  ringHead = (ringHead + 1) % BUFSZ;
+  if (ringCount < BUFSZ) ringCount++;
+}
+
+int oldestIndex() {
+  return (ringHead - ringCount + BUFSZ) % BUFSZ;
+}
+
+// -------- Minimal JSON parsing helpers (no extra libs) --------
+bool extractNumber(const String& body, const char* key, float& out) {
+  String tag = "\"" + String(key) + "\"";
+  int k = body.indexOf(tag);
+  if (k < 0) return false;
+  int colon = body.indexOf(':', k + tag.length());
+  if (colon < 0) return false;
+  int i = colon + 1;
+  while (i < (int)body.length() && (body[i] == ' ' || body[i] == '\t')) i++;
+  int j = i;
+  while (j < (int)body.length() && String("0123456789+-.eE").indexOf(body[j]) >= 0) j++;
+  if (j == i) return false;
+  out = body.substring(i, j).toFloat();
+  return true;
+}
+
+bool extractUint32(const String& body, const char* key, uint32_t& out) {
+  String tag = "\"" + String(key) + "\"";
+  int k = body.indexOf(tag);
+  if (k < 0) return false;
+  int colon = body.indexOf(':', k + tag.length());
+  if (colon < 0) return false;
+  int i = colon + 1;
+  while (i < (int)body.length() && (body[i] == ' ' || body[i] == '\t')) i++;
+  int j = i;
+  while (j < (int)body.length() && isDigit(body[j])) j++;
+  if (j == i) return false;
+  out = (uint32_t) strtoul(body.substring(i, j).c_str(), nullptr, 10);
+  return true;
+}
+
+bool extractLong(const String& body, const char* key, long& out) {
+  String tag = "\"" + String(key) + "\"";
+  int k = body.indexOf(tag);
+  if (k < 0) return false;
+  int colon = body.indexOf(':', k + tag.length());
+  if (colon < 0) return false;
+  int i = colon + 1;
+  while (i < (int)body.length() && (body[i] == ' ' || body[i] == '\t')) i++;
+  int j = i;
+  while (j < (int)body.length() && (isDigit(body[j]) || body[j]=='-' || body[j]=='+')) j++;
+  if (j == i) return false;
+  out = strtol(body.substring(i, j).c_str(), nullptr, 10);
+  return true;
+}
+
+// -------- HTTP handlers --------
+void handleRoot() {
+  String s;
+  s.reserve(9000);
+  s += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  s += "<title>ESP32 AP Dashboard</title>";
+  s += "<style>";
+  s += "body{font-family:Inter,Arial,sans-serif;margin:16px} h2{margin:6px 0 12px}";
+  s += ".cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:12px}";
+  s += ".card{border:1px solid #e0e0e0;border-radius:10px;padding:10px;background:#fff}";
+  s += ".label{color:#666;font-size:12px} .val{font-size:22px;font-weight:600;margin-top:2px}";
+  s += "table{border-collapse:collapse;width:100%;font-size:14px} th,td{border:1px solid #ddd;padding:6px 8px;text-align:right}";
+  s += "th{background:#f7f7f7;text-align:center} tr:nth-child(even){background:#fafafa}";
+  s += ".muted{color:#777} .row{display:flex;gap:12px;align-items:center;margin:8px 0}";
+  s += "a{color:#0b5;text-decoration:none} a:hover{text-decoration:underline}";
+  s += "</style></head><body>";
+  s += "<h2>ESP32 AP Dashboard</h2>";
+  s += "<div class='row'><div class='muted'>SSID: <b>"; s += AP_SSID; s += "</b> · IP: <b>192.168.4.1</b></div>";
+  s += "<div><a href='/export.html'>export.html</a> · <a href='/csv'>csv</a> · <a href='/series.json'>series.json</a></div></div>";
+  s += "<div class='cards'>";
+  s += "<div class='card'><div class='label'>BMP Temp (°C)</div><div id='t' class='val'>--</div></div>";
+  s += "<div class='card'><div class='label'>DHT Temp (°C)</div><div id='td' class='val'>--</div></div>";
+  s += "<div class='card'><div class='label'>Humidity (%)</div><div id='h' class='val'>--</div></div>";
+  s += "<div class='card'><div class='label'>Pressure (hPa)</div><div id='p' class='val'>--</div></div>";
+  s += "<div class='card'><div class='label'>Seq</div><div id='seq' class='val'>--</div></div>";
+  s += "<div class='card'><div class='label'>Age</div><div id='age' class='val'>--</div></div>";
+  s += "</div>";
+
+  s += "<h3 style='margin:10px 0 6px'>Recent samples</h3>";
+  s += "<table><thead><tr><th>#</th><th>t+sec</th><th>BMP Temp (°C)</th><th>DHT Temp (°C)</th><th>Humidity (%)</th><th>Pressure (hPa)</th></tr></thead><tbody id='tb'></tbody></table>";
+
+  s += "<script>";
+  s += "let t0=null; function fmt(x,d){return (x===undefined||x===null||isNaN(x))?'--':x.toFixed(d);} ";
+  s += "async function poll(){";
+  s += " try{ const r=await fetch('/series.json'); const j=await r.json(); const n=j.t_ms.length;";
+  s += " if(n>0){t0=j.t_ms[0]; const i=n-1;";
+  s += " document.getElementById('t').textContent=fmt(j.temperature_c[i],2);";
+  s += " document.getElementById('td').textContent=fmt(j.dht_temp_c[i],1);";
+  s += " document.getElementById('h').textContent=fmt(j.humidity_pct[i],1);";
+  s += " document.getElementById('p').textContent=fmt(j.pressure_hpa[i],2);";
+  s += " document.getElementById('seq').textContent=j.seq[i] ?? '--';";
+  s += " const age=((Date.now()-j.ap_ms[i])/1000).toFixed(1)+'s'; document.getElementById('age').textContent=age;";
+  s += " let html=''; const start=Math.max(0,n-12); for(let k=start;k<n;k++){";
+  s += "  html += `<tr><td>${k+1}</td><td>${((j.t_ms[k]-t0)/1000).toFixed(1)}</td>`+";
+  s += "          `<td>${fmt(j.temperature_c[k],2)}</td><td>${fmt(j.dht_temp_c[k],1)}</td>`+";
+  s += "          `<td>${fmt(j.humidity_pct[k],1)}</td><td>${fmt(j.pressure_hpa[k],2)}</td></tr>`; }";
+  s += " document.getElementById('tb').innerHTML=html; } }catch(e){} ";
+  s += "} setInterval(poll,1000); poll();";
+  s += "</script>";
+
+  s += "</body></html>";
+  server.send(200, "text/html; charset=utf-8", s);
+}
+
+void handleLatestJson() {
+  if (ringCount == 0) { server.send(404, "application/json", "{}"); return; }
+  int idx = (ringHead - 1 + BUFSZ) % BUFSZ;
+  const Sample& x = ring[idx];
+  String s = "{";
+  s += "\"seq\":" + String(x.seq) + ",";
+  s += "\"sensor_ms\":" + String(x.sensor_ms) + ",";
+  s += "\"ap_ms\":" + String(x.ap_ms) + ",";
+  if (finitef(x.temperature_c)) s += "\"temperature_c\":" + String(x.temperature_c, 2) + ",";
+  if (finitef(x.dht_temp_c))   s += "\"dht_temp_c\":"   + String(x.dht_temp_c, 1)   + ",";
+  if (finitef(x.humidity_pct)) s += "\"humidity_pct\":" + String(x.humidity_pct, 1) + ",";
+  if (finitef(x.pressure_hpa)) s += "\"pressure_hpa\":" + String(x.pressure_hpa, 2) + ",";
+  s += "\"window\":" + String(ringCount) + "}";
+  server.send(200, "application/json", s);
+}
+
+void handleSeriesJson() {
+  int n = ringCount;
+  String s; s.reserve(16000);
+  s += "{";
+  auto addArrF = [&](const char* name, auto getVal) {
+    s += "\""; s += name; s += "\":[";
+    for (int i = 0; i < n; i++) {
+      int idx = (oldestIndex() + i) % BUFSZ;
+      float v = getVal(ring[idx]);
+      if (!finitef(v)) s += "null";
+      else {
+        // choose precision by field
+        if (String(name).indexOf("temp")>=0) s += String(v, 2);
+        else if (String(name).indexOf("humidity")>=0) s += String(v, 1);
+        else if (String(name).indexOf("pressure")>=0) s += String(v, 2);
+        else s += String(v, 2);
+      }
+      if (i+1<n) s += ",";
+    }
+    s += "],";
+  };
+  auto addArrI = [&](const char* name, auto getVal) {
+    s += "\""; s += name; s += "\":[";
+    for (int i = 0; i < n; i++) {
+      int idx = (oldestIndex() + i) % BUFSZ;
+      s += String(getVal(ring[idx]));
+      if (i+1<n) s += ",";
+    }
+    s += "],";
+  };
+
+  addArrI("seq",      [](const Sample& x){ return x.seq; });
+  addArrI("t_ms",     [](const Sample& x){ return x.sensor_ms; });
+  addArrI("ap_ms",    [](const Sample& x){ return x.ap_ms; });
+  addArrF("temperature_c",[](const Sample& x){ return x.temperature_c; });
+  addArrF("dht_temp_c",    [](const Sample& x){ return x.dht_temp_c; });
+  addArrF("humidity_pct",  [](const Sample& x){ return x.humidity_pct; });
+  addArrF("pressure_hpa",  [](const Sample& x){ return x.pressure_hpa; });
+
+  s += "\"count\":" + String(n) + "}";
+  server.send(200, "application/json; charset=utf-8", s);
+}
+
+void handleCsv() {
+  String s;
+  s.reserve(12000);
+  s += "idx,seq,sensor_ms,ap_ms,temperature_c,dht_temp_c,humidity_pct,pressure_hpa\n";
+  int n = ringCount;
+  for (int i = 0; i < n; i++) {
+    int idx = (oldestIndex() + i) % BUFSZ;
+    const Sample& x = ring[idx];
+    s += String(i+1) + ",";
+    s += String(x.seq) + ",";
+    s += String(x.sensor_ms) + ",";
+    s += String(x.ap_ms) + ",";
+    s += (finitef(x.temperature_c) ? String(x.temperature_c,2) : String("")); s += ",";
+    s += (finitef(x.dht_temp_c)   ? String(x.dht_temp_c,1)   : String("")); s += ",";
+    s += (finitef(x.humidity_pct) ? String(x.humidity_pct,1) : String("")); s += ",";
+    s += (finitef(x.pressure_hpa) ? String(x.pressure_hpa,2) : String("")); s += "\n";
+  }
+  server.send(200, "text/csv; charset=utf-8", s);
+}
+
+// ------- Inline SVG export (server-side rendered) -------
+static inline void minMax(const float* vals, int n, float& vmin, float& vmax) {
+  vmin = NAN; vmax = NAN;
+  for (int i = 0; i < n; i++) {
+    float v = vals[i];
+    if (!finitef(v)) continue;
+    if (!finitef(vmin) || v < vmin) vmin = v;
+    if (!finitef(vmax) || v > vmax) vmax = v;
+  }
+}
+
+void svgPolyline(String& svg, const float* vals, int n, float vmin, float vmax,
+                 int x0, int y0, int width, int height, const char* color, bool dash=false) {
+  if (n <= 1 || !(finitef(vmin) && finitef(vmax))) return;
+  float span = vmax - vmin;
+  if (span <= 1e-6f) { vmin -= 0.5f; vmax += 0.5f; span = vmax - vmin; }
+  float stepX = (n > 1) ? (float)width / (n - 1) : width;
+  svg += "<polyline fill=\"none\" stroke=\""; svg += color; svg += "\" stroke-width=\"2\"";
+  if (dash) svg += " stroke-dasharray=\"4,3\"";
+  svg += " points=\"";
+  for (int i = 0; i < n; i++) {
+    float v = vals[i]; if (!finitef(v)) continue;
+    float x = x0 + i * stepX;
+    float y = y0 + height - ((v - vmin) / span) * height;
+    svg += String(x, 1); svg += ","; svg += String(y, 1); svg += " ";
+  }
+  svg += "\"/>\n";
+}
+
+void handleExportHtml() {
+  // snapshot
+  int n = ringCount;
+  Sample tmp[BUFSZ];
+  for (int i = 0; i < n; i++) {
+    int idx = (oldestIndex() + i) % BUFSZ;
+    tmp[i] = ring[idx];
+  }
+  // arrays
+  static float a_bmpT[BUFSZ], a_dhtT[BUFSZ], a_hum[BUFSZ], a_pres[BUFSZ];
+  for (int i = 0; i < n; i++) {
+    a_bmpT[i] = tmp[i].temperature_c;
+    a_dhtT[i] = tmp[i].dht_temp_c;
+    a_hum[i]  = tmp[i].humidity_pct;
+    a_pres[i] = tmp[i].pressure_hpa;
+  }
+  float bmpTmin, bmpTmax, dhtTmin, dhtTmax, humMin, humMax, pMin, pMax;
+  minMax(a_bmpT, n, bmpTmin, bmpTmax);
+  minMax(a_dhtT, n, dhtTmin, dhtTmax);
+  minMax(a_hum,  n, humMin,   humMax);
+  minMax(a_pres, n, pMin,     pMax);
+
+  String s;
+  s.reserve(26000);
+  s += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  s += "<title>AP Export</title>";
+  s += "<style>body{font-family:Inter,Arial,sans-serif;margin:16px} h2{margin:8px 0 12px}";
+  s += "table{border-collapse:collapse;width:100%;font-size:14px} th,td{border:1px solid #ddd;padding:6px 8px;text-align:right}";
+  s += "th{background:#f7f7f7;text-align:center} tr:nth-child(even){background:#fafafa}";
+  s += ".legend{margin:6px 0 10px}.box{border:1px solid #e0e0e0;border-radius:8px;padding:10px;margin-bottom:14px}";
+  s += "</style></head><body>";
+  s += "<h2>AP Export (" + String(n) + " samples)</h2>";
+
+  // SVG
+  int W = 760, H = 320, pad = 40;
+  int plotW = W - pad*2;
+  int plotH = (H - pad*2) / 3 - 10;
+  s += "<div class='box'><div class='legend'>";
+  s += "<span style='color:#e63946'>BMP Temp</span>, ";
+  s += "<span style='color:#457b9d'>DHT Temp</span> · ";
+  s += "<span style='color:#2a9d8f'>Humidity</span> · ";
+  s += "<span style='color:#6d597a'>Pressure</span>";
+  s += "</div><svg width='" + String(W) + "' height='" + String(H) + "' viewBox='0 0 " + String(W) + " " + String(H) + "'>";
+
+  int x0 = pad, y0 = pad;
+  // Temperature
+  s += "<g><text x='" + String(x0) + "' y='" + String(y0-10) + "' fill='#333' font-size='12'>Temperature (°C)</text>";
+  s += "<rect x='" + String(x0) + "' y='" + String(y0) + "' width='" + String(plotW) + "' height='" + String(plotH) + "' fill='#fff' stroke='#ddd'/>";
+  for (int g=0; g<=4; g++){ float gy=y0+plotH*g/4.0f; s += "<line x1='" + String(x0) + "' y1='" + String(gy) + "' x2='" + String(x0+plotW) + "' y2='" + String(gy) + "' stroke='#eee'/>"; }
+  float tMin=bmpTmin, tMax=bmpTmax;
+  if (finitef(dhtTmin)) { if (!finitef(tMin) || dhtTmin<tMin) tMin=dhtTmin; if (!finitef(tMax) || dhtTmax>tMax) tMax=dhtTmax; }
+  svgPolyline(s, a_bmpT, n, tMin, tMax, x0, y0, plotW, plotH, "#e63946", false);
+  svgPolyline(s, a_dhtT, n, tMin, tMax, x0, y0, plotW, plotH, "#457b9d", true);
+  s += "</g>";
+
+  // Humidity
+  y0 = pad + plotH + 30;
+  s += "<g><text x='" + String(x0) + "' y='" + String(y0-10) + "' fill='#333' font-size='12'>Humidity (%)</text>";
+  s += "<rect x='" + String(x0) + "' y='" + String(y0) + "' width='" + String(plotW) + "' height='" + String(plotH) + "' fill='#fff' stroke='#ddd'/>";
+  for (int g=0; g<=4; g++){ float gy=y0+plotH*g/4.0f; s += "<line x1='" + String(x0) + "' y1='" + String(gy) + "' x2='" + String(x0+plotW) + "' y2='" + String(gy) + "' stroke='#eee'/>"; }
+  svgPolyline(s, a_hum, n, humMin, humMax, x0, y0, plotW, plotH, "#2a9d8f", false);
+  s += "</g>";
+
+  // Pressure
+  y0 = pad + 2*(plotH + 30);
+  s += "<g><text x='" + String(x0) + "' y='" + String(y0-10) + "' fill='#333' font-size='12'>Pressure (hPa)</text>";
+  s += "<rect x='" + String(x0) + "' y='" + String(y0) + "' width='" + String(plotW) + "' height='" + String(plotH) + "' fill='#fff' stroke='#ddd'/>";
+  for (int g=0; g<=4; g++){ float gy=y0+plotH*g/4.0f; s += "<line x1='" + String(x0) + "' y1='" + String(gy) + "' x2='" + String(x0+plotW) + "' y2='" + String(gy) + "' stroke='#eee'/>"; }
+  svgPolyline(s, a_pres, n, pMin, pMax, x0, y0, plotW, plotH, "#6d597a", false);
+  s += "</g>";
+
+  s += "</svg></div>";
+
+  // Table
+  s += "<div class='box'><div>Oldest → newest</div><table><thead><tr>";
+  s += "<th>#</th><th>t+sec</th><th>BMP Temp (°C)</th><th>DHT Temp (°C)</th><th>Humidity (%)</th><th>Pressure (hPa)</th></tr></thead><tbody>";
+  uint32_t t0 = (n>0) ? tmp[0].sensor_ms : 0;
+  for (int i = 0; i < n; i++) {
+    s += "<tr><td>"; s += String(i+1); s += "</td><td>";
+    s += String((tmp[i].sensor_ms - t0)/1000.0f, 1); s += "</td><td>";
+    s += (finitef(tmp[i].temperature_c) ? String(tmp[i].temperature_c, 2) : String("--")); s += "</td><td>";
+    s += (finitef(tmp[i].dht_temp_c)   ? String(tmp[i].dht_temp_c, 1)    : String("--")); s += "</td><td>";
+    s += (finitef(tmp[i].humidity_pct) ? String(tmp[i].humidity_pct, 1)  : String("--")); s += "</td><td>";
+    s += (finitef(tmp[i].pressure_hpa) ? String(tmp[i].pressure_hpa, 2)  : String("--")); s += "</td></tr>";
+  }
+  s += "</tbody></table></div>";
+
+  s += "</body></html>";
+  server.send(200, "text/html; charset=utf-8", s);
+}
+
+void handleIngest() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  String body = server.arg("plain"); // raw body
+  if (body.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"empty body\"}");
+    return;
+  }
+
+  // Parse fields (optional ones may be missing)
+  Sample s{};
+  s.ap_ms = millis();
+  s.seq = -1;
+  s.sensor_ms = 0;
+  s.temperature_c = NAN;
+  s.pressure_hpa = NAN;
+  s.humidity_pct = NAN;
+  s.dht_temp_c = NAN;
+
+  long seqL;
+  if (extractLong(body, "seq", seqL)) s.seq = seqL;
+  uint32_t ts;
+  if (extractUint32(body, "timestamp_ms", ts)) s.sensor_ms = ts;
+  float f;
+  if (extractNumber(body, "temperature_c", f)) s.temperature_c = f;
+  if (extractNumber(body, "pressure_hpa", f))  s.pressure_hpa  = f;
+  if (extractNumber(body, "humidity_pct", f))  s.humidity_pct  = f;
+  if (extractNumber(body, "dht_temp_c", f))    s.dht_temp_c    = f;
+
+  bufferSample(s);
+
+  String ack = "{\"ok\":true,\"stored\":" + String(ringCount) + "}";
+  server.send(200, "application/json", ack);
+}
+
+// -------- Setup / Loop --------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  WiFi.mode(WIFI_AP);
+  bool ok;
+  if (strlen(AP_PASS) >= 8)
+    ok = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
+  else
+    ok = WiFi.softAP(AP_SSID, nullptr, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.println();
+  Serial.println(ok ? "SoftAP started" : "SoftAP start failed");
+  Serial.print("SSID: "); Serial.println(AP_SSID);
+  Serial.print("IP: ");   Serial.println(ip); // typically 192.168.4.1
+
+  server.on("/",            HTTP_GET,  handleRoot);
+  server.on("/latest.json", HTTP_GET,  handleLatestJson);
+  server.on("/series.json", HTTP_GET,  handleSeriesJson);
+  server.on("/csv",         HTTP_GET,  handleCsv);
+  server.on("/export.html", HTTP_GET,  handleExportHtml);
+  server.on("/ingest",      HTTP_POST, handleIngest);
+
+  // Fallback for CORS (optional)
+  server.onNotFound([](){
+    if (server.method() == HTTP_OPTIONS) {
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+      server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+      server.send(204);
+    } else {
+      server.send(404, "text/plain", "Not Found");
+    }
+  });
+
+  server.begin();
+  Serial.println("HTTP server started.");
+}
+
+void loop() {
+  server.handleClient();
+}
+
