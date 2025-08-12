@@ -1,4 +1,4 @@
-/*
+/* This code is abandoned don't use for now
   ESP32 USB-B sender: BMP280 + DHT11 @1Hz
   - Posts JSON to AP at http://192.168.4.1/ingest
   - Buffers last 46 samples
