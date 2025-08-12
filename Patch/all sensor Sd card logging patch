@@ -1,5 +1,6 @@
 // This is the final working code no wifi 
  //only SD card format
+// For final demo
 #include <Wire.h>
 #include <MPU6500_WE.h>
 #include <Adafruit_BMP280.h>
