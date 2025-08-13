@@ -1,228 +1,299 @@
-/*
-  Cansat-AP-Patched.ino
-  Board: ESP32-S3 Dev Module (USB-C)
-  Function: Start SoftAP reliably, receive UDP JSON, serve live dashboard at http://192.168.4.1/
-*/
+// CANSAT_AP_Dashboard_Refactor.ino (USB‑C ESP32)
+// Libraries: WiFi, WebServer, ArduinoJson
+// Tools → Partition Scheme: (PSRAM enabled if your board supports it) for bigger buffer.
 
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <WebServer.h>
-// Optional: Uncomment for deeper Wi-Fi control on some cores
-// #include "esp_wifi.h"
+#include <ArduinoJson.h>
 
-#define CANSAT_SSID      "CANSAT_AP"
-#define CANSAT_PASS      "cansat1234"
-#define CANSAT_UDP_PORT  4210
+#define AP_SSID "CANSAT_AP"
+#define AP_PASS "CANSAT123"
+#define MAX_CLIENTS 4
 
-// Network config
-static const IPAddress AP_IP(192,168,4,1);
-static const IPAddress AP_GW(192,168,4,1);
-static const IPAddress AP_NETMASK(255,255,255,0);
-
-// Globals
-WiFiUDP udp;
 WebServer server(80);
 
-String lastJson = "{}";
-unsigned long lastPacketMs = 0;
-IPAddress lastSender;
+// -------- Data model --------
+struct DataPoint {
+  uint32_t ts;
+  float temp, press, alt;
+  float accX, accY, accZ;
+  float gyrX, gyrY, gyrZ;
+  float heading;
+  float lat, lon;
+  char dir[16];
+};
 
-const char INDEX_HTML[] PROGMEM = R"HTML(
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+// Buffer strategy: prefer PSRAM if present, else small static buffer
+DataPoint* buf = nullptr;
+size_t CAP = 0;
+static const size_t CAP_STATIC = 900; // ~15 minutes @1 Hz, ~60–70 KB
+static DataPoint buf_static[CAP_STATIC];
+
+size_t head = 0;
+size_t count = 0;
+DataPoint lastPoint;
+bool haveFix = false;
+
+void initLastPoint() {
+  lastPoint.ts = 0;
+  lastPoint.temp = NAN; lastPoint.press = NAN; lastPoint.alt = NAN;
+  lastPoint.accX = NAN; lastPoint.accY = NAN; lastPoint.accZ = NAN;
+  lastPoint.gyrX = NAN; lastPoint.gyrY = NAN; lastPoint.gyrZ = NAN;
+  lastPoint.heading = NAN; lastPoint.lat = NAN; lastPoint.lon = NAN;
+  strncpy(lastPoint.dir, "--", sizeof(lastPoint.dir));
+}
+
+void addPoint(const DataPoint& dp) {
+  if (!buf || CAP == 0) return;
+  buf[head] = dp;
+  head = (head + 1) % CAP;
+  if (count < CAP) count++;
+  lastPoint = dp;
+  haveFix = isfinite(dp.lat) && isfinite(dp.lon);
+}
+
+// -------- PROGMEM UI (no DRAM usage) --------
+const char htmlIndex[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>CANSAT Dashboard</title>
 <style>
-:root { color-scheme: light dark; }
-body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
-h1 { margin: 0 0 8px; font-size: 20px; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 12px; }
-.card { border: 1px solid #8883; border-radius: 8px; padding: 12px; }
-.muted { opacity: .7; font-size: 12px; }
-.badge { display:inline-block; padding:2px 6px; border-radius:999px; background:#0a84ff20; }
-.big { font-size: 22px; font-weight: 600; }
-pre { white-space: pre-wrap; word-break: break-word; }
-</style>
-</head>
+  :root { --bg:#0f172a; --card:#111827; --accent:#38bdf8; --text:#e5e7eb; --muted:#9ca3af; --good:#22c55e; --warn:#f59e0b; }
+  *{box-sizing:border-box} body{margin:0;background:linear-gradient(160deg,#0b1220,#121a2b 60%,#0b1323);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Arial}
+  header{padding:16px 20px;display:flex;align-items:center;justify-content:space-between}
+  .brand{font-weight:700;letter-spacing:.4px}
+  .pill{background:rgba(56,189,248,.15);border:1px solid rgba(56,189,248,.35);color:var(--accent);padding:6px 10px;border-radius:999px;font-size:12px}
+  .grid{display:grid;gap:12px;padding:0 16px 16px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+  .card{background:linear-gradient(180deg,rgba(17,24,39,.9),rgba(17,24,39,.7));border:1px solid rgba(148,163,184,.1);border-radius:14px;padding:14px;box-shadow:0 8px 30px rgba(0,0,0,.25)}
+  .label{color:var(--muted);font-size:12px;margin-bottom:6px}
+  .value{font-size:22px;font-weight:700;letter-spacing:.2px}
+  .sub{font-size:12px;color:var(--muted)}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .compass{width:56px;height:56px;border:2px solid rgba(148,163,184,.2);border-radius:50%;position:relative}
+  .needle{position:absolute;left:50%;top:50%;width:2px;height:22px;background:var(--accent);transform-origin:bottom center}
+  .badge{font-size:12px;padding:4px 8px;border-radius:999px;border:1px solid rgba(148,163,184,.2)}
+  .ok{color:var(--good);border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.12)}
+  .warn{color:var(--warn);border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.12)}
+  .toolbar{padding:8px 16px 4px;display:flex;gap:10px;align-items:center}
+  button{background:var(--accent);color:#001018;border:none;padding:10px 14px;border-radius:10px;font-weight:700;cursor:pointer}
+  button.secondary{background:transparent;color:var(--text);border:1px solid rgba(148,163,184,.25)}
+  canvas{width:100%;height:220px;display:block}
+  .chart-card{padding-top:4px}
+  .legend{display:flex;gap:12px;align-items:center;font-size:12px;color:var(--muted);padding:0 4px 8px}
+  .dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px}
+  .c1{background:#60a5fa}.c2{background:#34d399}.c3{background:#f472b6}
+</style></head>
 <body>
-  <h1>CANSAT Live</h1>
-  <div class="muted">AP SSID: <b id="ssid"></b> • AP IP: <b id="apip"></b> • Last packet: <b id="age">—</b> ms • From: <b id="from">—</b></div>
-  <div class="grid" style="margin-top:12px;">
-    <div class="card"><div class="muted">Temperature</div><div class="big"><span id="temp">—</span> °C</div></div>
-    <div class="card"><div class="muted">Pressure</div><div class="big"><span id="press">—</span> hPa</div></div>
-    <div class="card"><div class="muted">BMP Altitude</div><div class="big"><span id="alt">—</span> m</div></div>
-    <div class="card">
-      <div class="muted">GPS</div>
-      <div><span class="badge">lat</span> <span id="lat">—</span></div>
-      <div><span class="badge">lon</span> <span id="lon">—</span></div>
-      <div><span class="badge">alt</span> <span id="galt">—</span> m</div>
-      <div><span class="badge">sat</span> <span id="sat">—</span></div>
-      <div><span class="badge">speed</span> <span id="spd">—</span> km/h</div>
-    </div>
-    <div class="card"><div class="muted">Link RSSI</div><div class="big"><span id="rssi">—</span> dBm</div></div>
-  </div>
-  <div class="card" style="margin-top:12px;"><div class="muted">Raw JSON</div><pre id="raw">{}</pre></div>
+<header><div class="brand">CANSAT Live Dashboard</div><div class="pill">SoftAP: CANSAT_AP</div></header>
+<div class="toolbar">
+  <button id="export">Export CSV now</button>
+  <button id="toggleAuto" class="secondary">Auto-export: ON</button>
+  <span class="sub" id="status">Waiting for data…</span>
+</div>
+<section class="grid">
+  <div class="card"><div class="label">Temperature</div><div class="value" id="temp">--</div><div class="sub">°C</div></div>
+  <div class="card"><div class="label">Pressure</div><div class="value" id="press">--</div><div class="sub">hPa</div></div>
+  <div class="card"><div class="label">Altitude</div><div class="value" id="alt">--</div><div class="sub">m</div></div>
+  <div class="card"><div class="label">Compass</div><div class="row"><div class="compass"><div id="needle" class="needle" style="transform:translate(-50%,-100%) rotate(0deg)"></div></div>
+    <div><div class="value" id="heading">--°</div><div class="sub" id="dir">--</div></div></div></div>
+  <div class="card"><div class="label">Acceleration (m/s²)</div><div class="value"><span id="accX">--</span> / <span id="accY">--</span> / <span id="accZ">--</span></div><div class="sub">X / Y / Z</div></div>
+  <div class="card"><div class="label">Gyroscope (°/s)</div><div class="value"><span id="gyrX">--</span> / <span id="gyrY">--</span> / <span id="gyrZ">--</span></div><div class="sub">Pitch / Roll / Yaw</div></div>
+  <div class="card"><div class="label">GPS</div><div class="value"><span id="lat">--</span>, <span id="lon">--</span></div><div class="sub"><span id="fix" class="badge warn">No Fix</span></div></div>
+</section>
+<section class="grid">
+  <div class="card chart-card"><div class="legend">
+    <span><i class="dot c1"></i>Temp (°C)</span>
+    <span><i class="dot c2"></i>Pressure (hPa)</span>
+    <span><i class="dot c3"></i>Altitude (m)</span>
+  </div><canvas id="chart" width="900" height="240"></canvas></div>
+</section>
 <script>
-const ssid = "%SSID%", apip = "%APIP%";
-document.getElementById('ssid').textContent = ssid;
-document.getElementById('apip').textContent = apip;
-let lastSeen = 0, lastFrom = "—";
-function v(x){ return (x===null||x===undefined||Number.isNaN(x)) ? "—" : +(+x).toFixed(2); }
-async function poll(){
-  try{
-    const r = await fetch('/data'); if(!r.ok) throw new Error(r.status);
-    const j = await r.json();
-    lastSeen = j._server_ms - j._last_ms; lastFrom = j._from || "—";
-    const s=j.sensor||{}, g=j.gps||{}, n=j.net||{};
-    document.getElementById('temp').textContent  = v(s.temp_c);
-    document.getElementById('press').textContent = v(s.pressure_hpa);
-    document.getElementById('alt').textContent   = v(s.alt_m);
-    document.getElementById('lat').textContent   = v(g.lat);
-    document.getElementById('lon').textContent   = v(g.lon);
-    document.getElementById('galt').textContent  = v(g.alt_m);
-    document.getElementById('sat').textContent   = g.sat ?? "—";
-    document.getElementById('spd').textContent   = v(g.speed_kmh);
-    document.getElementById('rssi').textContent  = n.rssi ?? "—";
-    document.getElementById('raw').textContent   = JSON.stringify(j, null, 2);
-  }catch(e){}
-  document.getElementById('age').textContent = lastSeen;
-  document.getElementById('from').textContent = lastFrom;
-  setTimeout(poll, 250);
+const ui={temp:temp,press:press,alt:alt,accX:accX,accY:accY,accZ:accZ,gyrX:gyrX,gyrY:gyrY,gyrZ:gyrZ,heading:heading,dir:dir,needle:needle,lat:lat,lon:lon,fix:fix,status:status,exportBtn:export,toggleAuto:toggleAuto,canvas:chart};
+let auto=true,timerCSV=null,lastTs=0;
+const ctx=ui.canvas.getContext('2d'); const series={t:[],temp:[],press:[],alt:[]}; const MAX_PTS=600;
+function addPoint(p){series.t.push(p.ts);series.temp.push(p.temp??NaN);series.press.push(p.press??NaN);series.alt.push(p.alt??NaN);if(series.t.length>MAX_PTS){['t','temp','press','alt'].forEach(k=>series[k].shift());}}
+function draw(){const w=ui.canvas.width,h=ui.canvas.height;ctx.clearRect(0,0,w,h);const L=40,R=10,T=10,B=20,W=w-L-R,H=h-T-B;ctx.strokeStyle='rgba(148,163,184,.35)';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(L,T);ctx.lineTo(L,T+H);ctx.lineTo(L+W,T+H);ctx.stroke();const n=series.t.length; if(!n) return; const xmin=series.t[0], xmax=series.t[n-1]||xmin+1; const xr=Math.max(1,xmax-xmin);
+function lim(a){let mn=Infinity,mx=-Infinity;for(let v of a){if(!isNaN(v)){if(v<mn)mn=v;if(v>mx)mx=v;}} if(mn===Infinity){mn=0;mx=1;} if(mx-mn<1e-6){mx=mn+1;} return [mn,mx];}
+const [tmin,tmax]=lim(series.temp), [pmin,pmax]=lim(series.press), [amin,amax]=lim(series.alt);
+const x=t=>L+((t-xmin)/xr)*W, y=(v,mn,mx)=>T+(1-(v-mn)/(mx-mn))*H;
+function line(arr,color,mn,mx){ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=2;for(let i=0;i<n;i++){const v=arr[i];if(isNaN(v)) continue; const xx=x(series.t[i]), yy=y(v,mn,mx); if(i===0) ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy);} ctx.stroke();}
+line(series.temp,'#60a5fa',tmin,tmax); line(series.press,'#34d399',pmin,pmax); line(series.alt,'#f472b6',amin,amax);}
+function tick(){fetch('/latest.json',{cache:'no-store'}).then(r=>r.ok?r.json():Promise.reject()).then(p=>{if(!p||p.ts===undefined)return;
+ui.temp.textContent=fmt(p.temp); ui.press.textContent=fmt(p.press); ui.alt.textContent=fmt(p.alt);
+ui.accX.textContent=fmt(p.accX); ui.accY.textContent=fmt(p.accY); ui.accZ.textContent=fmt(p.accZ);
+ui.gyrX.textContent=fmt(p.gyrX); ui.gyrY.textContent=fmt(p.gyrY); ui.gyrZ.textContent=fmt(p.gyrZ);
+ui.heading.textContent=(p.heading!=null)?(p.heading.toFixed(1)+'°'):'--°'; ui.dir.textContent=p.dir??'--'; ui.needle.style.transform=`translate(-50%,-100%) rotate(${(p.heading||0)}deg)`;
+const fx=(p.lat!=null && p.lon!=null); ui.lat.textContent=fx? p.lat.toFixed(6) : '--'; ui.lon.textContent=fx? p.lon.toFixed(6) : '--';
+ui.fix.textContent=fx? 'GPS Fix':'No Fix'; ui.fix.className='badge '+(fx?'ok':'warn');
+ui.status.textContent=`Live: ${new Date().toLocaleTimeString()} | points: ${series.t.length}`;
+if(p.ts!==lastTs){lastTs=p.ts; addPoint(p); draw();}}).catch(()=>{});
 }
-poll();
-</script>
-</body>
-</html>
-)HTML";
+function fmt(v){return (v==null||Number.isNaN(v))?'--':(Math.abs(v)<10?v.toFixed(2):v.toFixed(1));}
+function exportCSV(){fetch('/export.csv',{cache:'no-store'}).then(r=>r.blob()).then(b=>{const url=URL.createObjectURL(b);const a=document.createElement('a');const ts=new Date().toISOString().replace(/[:.]/g,'-');a.href=url;a.download=`cansat_${ts}.csv`;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);});}
+ui.exportBtn.addEventListener('click',exportCSV);
+ui.toggleAuto.addEventListener('click',()=>{auto=!auto; ui.toggleAuto.textContent=`Auto-export: ${auto?'ON':'OFF'}`; if(auto && !timerCSV) scheduleCSV(); if(!auto && timerCSV){clearInterval(timerCSV); timerCSV=null;}});
+function scheduleCSV(){timerCSV=setInterval(()=>{if(auto) exportCSV();}, 55000);}
+scheduleCSV(); setInterval(tick,1000);
+</script></body></html>)rawliteral";
 
-String expandTemplate(const String& tpl) {
-  String s = tpl;
-  s.replace("%SSID%", String(CANSAT_SSID));
-  s.replace("%APIP%", WiFi.softAPIP().toString());
-  return s;
-}
-
+// -------- Handlers --------
 void handleRoot() {
-  String html = expandTemplate(String(FPSTR(INDEX_HTML)));
-  server.send(200, "text/html; charset=utf-8", html);
+  server.send_P(200, "text/html; charset=utf-8", htmlIndex);
 }
 
-void handleData() {
-  String body;
-  body.reserve(lastJson.length() + 96);
-  body += "{";
-  body += "\"_server_ms\":" + String(millis());
-  body += ",\"_last_ms\":" + String(lastPacketMs);
-  body += ",\"_from\":\"" + lastSender.toString() + "\"";
-  if (lastJson.length() > 2) {
-    body += ",";
-    if (lastJson.startsWith("{") && lastJson.endsWith("}")) {
-      body += lastJson.substring(1, lastJson.length() - 1);
+void handleLatest() {
+  StaticJsonDocument<512> doc;
+  if (count == 0) {
+    doc["status"] = "empty";
+  } else {
+    doc["ts"] = lastPoint.ts;
+
+    if (isfinite(lastPoint.temp))   doc["temp"]   = lastPoint.temp;   else doc["temp"]   = nullptr;
+    if (isfinite(lastPoint.press))  doc["press"]  = lastPoint.press;  else doc["press"]  = nullptr;
+    if (isfinite(lastPoint.alt))    doc["alt"]    = lastPoint.alt;    else doc["alt"]    = nullptr;
+
+    if (isfinite(lastPoint.accX))   doc["accX"]   = lastPoint.accX;   else doc["accX"]   = nullptr;
+    if (isfinite(lastPoint.accY))   doc["accY"]   = lastPoint.accY;   else doc["accY"]   = nullptr;
+    if (isfinite(lastPoint.accZ))   doc["accZ"]   = lastPoint.accZ;   else doc["accZ"]   = nullptr;
+
+    if (isfinite(lastPoint.gyrX))   doc["gyrX"]   = lastPoint.gyrX;   else doc["gyrX"]   = nullptr;
+    if (isfinite(lastPoint.gyrY))   doc["gyrY"]   = lastPoint.gyrY;   else doc["gyrY"]   = nullptr;
+    if (isfinite(lastPoint.gyrZ))   doc["gyrZ"]   = lastPoint.gyrZ;   else doc["gyrZ"]   = nullptr;
+
+    if (isfinite(lastPoint.heading))doc["heading"]= lastPoint.heading;else doc["heading"]= nullptr;
+
+    doc["dir"] = lastPoint.dir;
+
+    if (isfinite(lastPoint.lat) && isfinite(lastPoint.lon)) {
+      doc["lat"] = lastPoint.lat;
+      doc["lon"] = lastPoint.lon;
     } else {
-      body += "\"payload\":" + lastJson;
+      doc["lat"] = nullptr;
+      doc["lon"] = nullptr;
     }
   }
-  body += "}";
-  server.send(200, "application/json", body);
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
-// Robust AP start sequence
-bool startSoftAPRobust() {
-  Serial.println("[WiFi] Resetting radio...");
-  WiFi.persistent(false);         // don't save config to NVS
-  WiFi.disconnect(true, true);    // drop STA/AP, clear creds
-  WiFi.mode(WIFI_MODE_NULL);
-  delay(150);
+void handleIngest() {
+  if (server.method() != HTTP_POST) { server.send(405, "text/plain", "Method Not Allowed"); return; }
+  String body = server.arg("plain");
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) { server.send(400, "text/plain", "Bad JSON"); return; }
 
-  // Disable Wi-Fi power save for stability
-  WiFi.setSleep(false);
-  // If using esp_wifi.h: esp_wifi_set_ps(WIFI_PS_NONE);
+  DataPoint dp;
+  dp.ts     = doc["ts"] | millis();
 
-  Serial.println("[WiFi] Configuring AP IP...");
-  if (!WiFi.softAPConfig(AP_IP, AP_GW, AP_NETMASK)) {
-    Serial.println("[WiFi] softAPConfig failed (continuing anyway)");
+  dp.temp   = doc["temp"].isNull()   ? NAN : (float)doc["temp"];
+  dp.press  = doc["press"].isNull()  ? NAN : (float)doc["press"];
+  dp.alt    = doc["alt"].isNull()    ? NAN : (float)doc["alt"];
+
+  dp.accX   = doc["accX"].isNull()   ? NAN : (float)doc["accX"];
+  dp.accY   = doc["accY"].isNull()   ? NAN : (float)doc["accY"];
+  dp.accZ   = doc["accZ"].isNull()   ? NAN : (float)doc["accZ"];
+
+  dp.gyrX   = doc["gyrX"].isNull()   ? NAN : (float)doc["gyrX"];
+  dp.gyrY   = doc["gyrY"].isNull()   ? NAN : (float)doc["gyrY"];
+  dp.gyrZ   = doc["gyrZ"].isNull()   ? NAN : (float)doc["gyrZ"];
+
+  dp.heading= doc["heading"].isNull()? NAN : (float)doc["heading"];
+
+  const char* d = doc["dir"] | "--";
+  memset(dp.dir, 0, sizeof(dp.dir));
+  strncpy(dp.dir, d, sizeof(dp.dir)-1);
+
+  if (!doc["lat"].isNull() && !doc["lon"].isNull()) {
+    dp.lat = (float)doc["lat"]; dp.lon = (float)doc["lon"];
+  } else {
+    dp.lat = NAN; dp.lon = NAN;
   }
 
-  // Bring up AP mode
+  addPoint(dp);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleExportCSV() {
+  // Stream CSV to avoid building a huge string in DRAM
+  server.sendHeader("Content-Type", "text/csv; charset=utf-8");
+  server.sendHeader("Content-Disposition", "attachment; filename=cansat_export.csv");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+
+  server.sendContent("ts,temp,press,alt,accX,accY,accZ,gyrX,gyrY,gyrZ,heading,dir,lat,lon\n");
+
+  if (count > 0 && buf) {
+    size_t start = (head + CAP - count) % CAP;
+    char line[196]; // stack line buffer
+    for (size_t i = 0; i < count; i++) {
+      const DataPoint& p = buf[(start + i) % CAP];
+      // Build one CSV line safely
+      int n = snprintf(line, sizeof(line),
+        "%lu,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+        (unsigned long)p.ts,
+        isfinite(p.temp)   ? String(p.temp,2).c_str()   : "",
+        isfinite(p.press)  ? String(p.press,2).c_str()  : "",
+        isfinite(p.alt)    ? String(p.alt,2).c_str()    : "",
+        isfinite(p.accX)   ? String(p.accX,2).c_str()   : "",
+        isfinite(p.accY)   ? String(p.accY,2).c_str()   : "",
+        isfinite(p.accZ)   ? String(p.accZ,2).c_str()   : "",
+        isfinite(p.gyrX)   ? String(p.gyrX,2).c_str()   : "",
+        isfinite(p.gyrY)   ? String(p.gyrY,2).c_str()   : "",
+        isfinite(p.gyrZ)   ? String(p.gyrZ,2).c_str()   : "",
+        isfinite(p.heading)? String(p.heading,1).c_str(): "",
+        p.dir,
+        (isfinite(p.lat) ? String(p.lat,6).c_str() : ""),
+        (isfinite(p.lon) ? String(p.lon,6).c_str() : "")
+      );
+      if (n > 0) server.sendContent(String(line));
+    }
+  }
+  // End chunked transfer
+  server.sendContent("");
+}
+
+void setupAP() {
   WiFi.mode(WIFI_AP);
-  delay(100);
+  WiFi.softAP(AP_SSID, AP_PASS, 6, 0, MAX_CLIENTS);
+  delay(200);
+  Serial.begin(115200);
+  Serial.println("\nSoftAP started: " + String(AP_SSID));
+  Serial.print("IP: "); Serial.println(WiFi.softAPIP());
+}
 
-  // 1) Minimal bring-up (most reliable on some cores)
-  Serial.println("[WiFi] Starting SoftAP (minimal)...");
-  bool ok = WiFi.softAP(CANSAT_SSID, CANSAT_PASS);
-  if (ok) return true;
-
-  Serial.println("[WiFi] Minimal start failed, retrying with clean reinit...");
-  WiFi.mode(WIFI_MODE_NULL); delay(150);
-  WiFi.mode(WIFI_AP); delay(100);
-  ok = WiFi.softAP(CANSAT_SSID, CANSAT_PASS);
-  if (ok) return true;
-
-  // 2) Try explicit channel & max connections
-  Serial.println("[WiFi] Retrying SoftAP with channel=6, maxconn=4...");
-  ok = WiFi.softAP(CANSAT_SSID, CANSAT_PASS, 6, false, 4);
-  if (ok) return true;
-
-  // 3) As last resort, open AP (no password) for diagnostics
-  Serial.println("[WiFi] Retrying OPEN AP (diagnostic)...");
-  ok = WiFi.softAP(CANSAT_SSID);
-  return ok;
+void setupBuffer() {
+  initLastPoint();
+  if (psramFound()) {
+    // Aim for ~3600 points if PSRAM is available (~250 KB worst case)
+    size_t desired = 3600;
+    DataPoint* tmp = (DataPoint*) ps_malloc(sizeof(DataPoint) * desired);
+    if (tmp) {
+      buf = tmp;
+      CAP = desired;
+      Serial.printf("Using PSRAM buffer: %u points (~%u KB)\n", (unsigned)CAP, (unsigned)(CAP*sizeof(DataPoint)/1024));
+      return;
+    } else {
+      Serial.println("PSRAM alloc failed, falling back to static buffer.");
+    }
+  }
+  // Fallback static buffer
+  buf = buf_static;
+  CAP = CAP_STATIC;
+  Serial.printf("Using static DRAM buffer: %u points (~%u KB)\n", (unsigned)CAP, (unsigned)(CAP*sizeof(DataPoint)/1024));
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(1200); // allow USB CDC settle on S3
-
-  Serial.println("\n==== CANSAT AP Boot ====");
-  bool apOK = startSoftAPRobust();
-
-  IPAddress ip = WiFi.softAPIP();
-  Serial.printf("[WiFi] SoftAP %s\n", apOK ? "STARTED" : "FAILED");
-  Serial.print("[WiFi] AP IP: "); Serial.println(ip);
-
-  if (!apOK || ip == IPAddress((uint32_t)0)) {
-    Serial.println("[WiFi] WARNING: AP not up. Check core version/USB power/antenna.");
-    // Continue to attempt, but dashboard will be unreachable until AP starts.
-  }
-
-  // UDP receiver
-  udp.begin(CANSAT_UDP_PORT);
-  Serial.print("[UDP] Listening on port "); Serial.println(CANSAT_UDP_PORT);
-
-  // Web server
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/data", HTTP_GET, handleData);
-  server.on("/health", HTTP_GET, [](){
-    String s = String("{\"ap\":\"") + CANSAT_SSID + "\",\"ip\":\"" + WiFi.softAPIP().toString() + "\"}";
-    server.send(200, "application/json", s);
-  });
-  server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
+  setupAP();
+  setupBuffer();
+  server.on("/", handleRoot);
+  server.on("/latest.json", HTTP_GET, handleLatest);
+  server.on("/ingest", HTTP_POST, handleIngest);
+  server.on("/export.csv", HTTP_GET, handleExportCSV);
   server.begin();
-  Serial.println("[HTTP] Server started");
-
-  Serial.println("==== Ready: connect to SSID and open http://192.168.4.1/ ====");
 }
 
 void loop() {
   server.handleClient();
-
-  int packetSize = udp.parsePacket();
-  if (packetSize > 0) {
-    static char buf[1200];
-    int len = udp.read(buf, sizeof(buf) - 1);
-    if (len > 0) {
-      buf[len] = '\0';
-      String s(buf);
-      if (s.startsWith("{") && s.indexOf('}') > 0) {
-        lastJson = s;
-      } else {
-        lastJson = String("{\"payload\":\"") + s + "\"}";
-      }
-      lastPacketMs = millis();
-      lastSender = udp.remoteIP();
-      Serial.print("[UDP] RX "); Serial.print(lastSender); Serial.print(" : ");
-      Serial.println(lastJson);
-    }
-  }
 }
